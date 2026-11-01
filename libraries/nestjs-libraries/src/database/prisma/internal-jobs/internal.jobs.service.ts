@@ -4,7 +4,7 @@ import { InternalJobsRepository } from './internal.jobs.repository';
 
 @Injectable()
 export class InternalJobsService {
-  // The eventual worker renews the lease while a provider request is running.
+  // The worker renews the lease while a provider request is running.
   // Lost publish leases always require reconciliation, even after renewal.
   readonly leaseMilliseconds = 60_000;
   readonly maxReadAttempts = 5;
@@ -50,6 +50,13 @@ export class InternalJobsService {
 
   finish(job: InternalJob, now = new Date()) {
     return this._jobs.finish(job, now);
+  }
+
+  rejectBeforePublish(job: InternalJob) {
+    return this._jobs.rejectBeforePublish(job);
+  }
+  cancelClaim(job: InternalJob) {
+    return this._jobs.cancelClaim(job);
   }
 
   fail(job: InternalJob, now = new Date()) {

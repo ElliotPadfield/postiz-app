@@ -1,5 +1,7 @@
 import {
   AnalyticsData,
+  PostInsights,
+  PostInsightMetric,
   AuthTokenDetails,
   PendingCheckResponse,
   PostDetails,
@@ -11,6 +13,7 @@ import { timer } from '@gitroom/helpers/utils/timer';
 import dayjs from 'dayjs';
 import {
   BadBody,
+  RefreshToken,
   Disconnect,
   SocialAbstract,
   ValidityMedia,
@@ -421,8 +424,9 @@ export class InstagramProvider
     if (body.indexOf('too little or too many attachments') > -1) {
       return {
         type: 'bad-body' as const,
-        value: 'Instagram carousel should have between 2 and 10 media attachments',
-      }
+        value:
+          'Instagram carousel should have between 2 and 10 media attachments',
+      };
     }
 
     if (body.indexOf('2207027') > -1) {
@@ -436,7 +440,7 @@ export class InstagramProvider
       return {
         type: 'bad-body' as const,
         value:
-          "One of the collaborators could not be tagged, please check the username is correct, the account is public, and that it allows collaborator invites",
+          'One of the collaborators could not be tagged, please check the username is correct, the account is public, and that it allows collaborator invites',
       };
     }
 
@@ -732,7 +736,9 @@ export class InstagramProvider
           : { data: [] };
       const mediaId = data?.[0]?.id || '';
       console.log(
-        `Instagram blocked media_publish for container ${containerId}: status ${status}, media ${mediaId || 'none'}`
+        `Instagram blocked media_publish for container ${containerId}: status ${status}, media ${
+          mediaId || 'none'
+        }`
       );
       return mediaId;
     } catch (e) {
@@ -800,9 +806,9 @@ export class InstagramProvider
             ? isStory
               ? `video_url=${m.path}&media_type=STORIES`
               : m?.thumbnail
-              ? `video_url=${m.path}&media_type=REELS&cover_url=${encodeURIComponent(
-                  m.thumbnail
-                )}`
+              ? `video_url=${
+                  m.path
+                }&media_type=REELS&cover_url=${encodeURIComponent(m.thumbnail)}`
               : `video_url=${m.path}&media_type=REELS&thumb_offset=${
                   m?.thumbnailTimestamp || 0
                 }`
@@ -1031,7 +1037,9 @@ export class InstagramProvider
       // re-running this is safe)
       const { id: containerId } = await (
         await this.fetch(
-          `https://${pendingData.type}/${META_GRAPH_API_VERSION}/${igId}/media?caption=${encodeURIComponent(
+          `https://${
+            pendingData.type
+          }/${META_GRAPH_API_VERSION}/${igId}/media?caption=${encodeURIComponent(
             pendingData.message || ''
           )}&media_type=CAROUSEL&children=${encodeURIComponent(
             pendingData.containers.join(',')
@@ -1353,6 +1361,112 @@ export class InstagramProvider
       duration: audio.duration_in_ms || 0,
       previewUrl: audio.download_url || '',
     }));
+  }
+
+  async postInsights(
+    integrationId: string,
+    token: string,
+    postId: string,
+    days: number,
+    host = 'graph.facebook.com'
+  ): Promise<PostInsights> {
+    const accessToken = token.split('___')[0];
+    const definitions: Array<[string, string, PostInsightMetric['unit']]> = [
+      ['views', 'Views', 'count'],
+      ['reach', 'Accounts reached', 'count'],
+      ['likes', 'Likes', 'count'],
+      ['comments', 'Comments', 'count'],
+      ['shares', 'Shares', 'count'],
+      ['saved', 'Saves', 'count'],
+      ['ig_reels_avg_watch_time', 'Average watch time', 'milliseconds'],
+      ['ig_reels_video_view_total_time', 'Total watch time', 'milliseconds'],
+      ['reels_skip_rate', 'Skipped in the first 3 seconds', 'percent'],
+    ];
+    // Fetch common counts together, isolating the three Reel-only metrics.
+    // If a common metric is unsupported, fall back to individual reads.
+    const load = async (
+      group: typeof definitions
+    ): Promise<PostInsightMetric[]> => {
+      const url = new URL(
+        `https://${host}/${META_GRAPH_API_VERSION}/${encodeURIComponent(
+          postId
+        )}/insights`
+      );
+      url.searchParams.set('metric', group.map(([key]) => key).join(','));
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(30000),
+      });
+      const body = await response.json();
+      if (response.status === 401 || body.error?.code === 190)
+        throw new RefreshToken(
+          this.identifier,
+          '{}',
+          '{}',
+          'Reconnect Instagram'
+        );
+      if (
+        response.status === 429 ||
+        response.status >= 500 ||
+        [4, 17, 32, 613].includes(body.error?.code)
+      )
+        throw new Error('Instagram insights temporarily unavailable');
+      if (!response.ok && group.length > 1) {
+        const result: PostInsightMetric[] = [];
+        for (const definition of group)
+          result.push(...(await load([definition])));
+        return result;
+      }
+      return group.map(([key, label, unit]) => {
+        const metric = body.data?.find((item: any) => item.name === key);
+        const raw = metric?.values?.[0]?.value ?? metric?.total_value?.value;
+        const value =
+          typeof raw === 'number' && Number.isFinite(raw) ? raw : null;
+        return {
+          key,
+          label,
+          value,
+          unit,
+          source: `instagram.media.insights.${key}`,
+          period: 'lifetime',
+          ...(value === null
+            ? {
+                unavailable: response.ok
+                  ? 'No data returned for this post'
+                  : 'Metric unavailable for this post or granted permissions',
+              }
+            : {}),
+        };
+      });
+    };
+    const metrics = await load(definitions.slice(0, 6));
+    for (const definition of definitions.slice(6))
+      metrics.push(...(await load([definition])));
+    const views = metrics.find((m) => m.key === 'views')?.value;
+    for (const [key, label] of [
+      ['likes', 'Likes per 100 views'],
+      ['shares', 'Shares per 100 views'],
+      ['saved', 'Saves per 100 views'],
+    ]) {
+      const count = metrics.find((m) => m.key === key)?.value;
+      metrics.push({
+        key: `${key}_per_100_views`,
+        label,
+        value:
+          views > 0 && count !== null && count !== undefined
+            ? (count / views) * 100
+            : null,
+        unit: 'percent',
+        period: 'lifetime',
+        source: `derived:${key}/views*100`,
+      });
+    }
+    return {
+      metrics,
+      retention: [],
+      retentionUnavailable:
+        'Instagram does not expose a verified retention-curve endpoint here. Retention screenshots can be kept with the original video.',
+    };
   }
 
   async postAnalytics(

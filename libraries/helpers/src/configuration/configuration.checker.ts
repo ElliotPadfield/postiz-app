@@ -58,24 +58,7 @@ export class ConfigurationChecker {
   }
 
   checkDatabaseServers() {
-    this.checkRedis();
     this.checkIsValidUrl('DATABASE_URL');
-  }
-
-  checkRedis() {
-    if (!this.cfg.REDIS_URL) {
-      this.issues.push('REDIS_URL not set');
-    }
-
-    try {
-      const redisUrl = new URL(this.cfg.REDIS_URL);
-
-      if (redisUrl.protocol !== 'redis:') {
-        this.issues.push('REDIS_URL must start with redis://');
-      }
-    } catch (error) {
-      this.issues.push('REDIS_URL is not a valid URL');
-    }
   }
 
   checkIsValidUrl(key: string) {

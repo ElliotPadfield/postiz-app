@@ -4,14 +4,13 @@ import { ResendProvider } from '@gitroom/nestjs-libraries/emails/resend.provider
 import { EmptyProvider } from '@gitroom/nestjs-libraries/emails/empty.provider';
 import { NodeMailerProvider } from '@gitroom/nestjs-libraries/emails/node.mailer.provider';
 import { SesProvider } from '@gitroom/nestjs-libraries/emails/ses.provider';
-import { TemporalService } from 'nestjs-temporal-core';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { randomUUID } from 'crypto';
 
 @Injectable()
 export class EmailService {
   emailService: EmailInterface;
-  constructor(private _temporalService: TemporalService) {
+  constructor() {
     this.emailService = this.selectProvider(process.env.EMAIL_PROVIDER!);
     console.log('Email service provider:', this.emailService.name);
     for (const key of this.emailService.validateEnvKeys) {
@@ -49,13 +48,7 @@ export class EmailService {
       return;
     }
 
-    return this._temporalService.client
-      .getRawClient()
-      ?.workflow.start('sendSingleEmailWorkflow', {
-        taskQueue: 'main',
-        workflowId: `send_email_${randomUUID()}`,
-        args: [{ to, subject, html, replyTo, addTo }],
-      });
+    return this.sendEmailSync(to, subject, html, replyTo);
   }
 
   async sendEmailSync(

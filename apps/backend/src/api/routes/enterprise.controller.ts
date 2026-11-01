@@ -1,7 +1,7 @@
 import { Body, Controller, Param, Post, Res } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { AuthService } from '@gitroom/helpers/auth/auth.service';
-import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
+import { stateStore } from '@gitroom/nestjs-libraries/state/postgres.state';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
 import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
@@ -20,7 +20,8 @@ export class EnterpriseController {
   private verifyEnterpriseToken<T extends object>(params: string): T {
     const payload = AuthService.verifyJWT(params) as any;
     if (
-      !payload || typeof payload !== 'object' ||
+      !payload ||
+      typeof payload !== 'object' ||
       'providerName' in payload || // login token (full User row)
       'orgId' in payload || // team invite token
       'expires' in payload // password reset token
@@ -103,13 +104,13 @@ export class EnterpriseController {
         await integrationProvider.generateAuthUrl();
 
       if (load.refreshId) {
-        await ioRedis.set(`refresh:${state}`, load.refreshId, 'EX', 3600);
+        await stateStore.set(`refresh:${state}`, load.refreshId, 'EX', 3600);
       }
 
-      await ioRedis.set(`webhookUrl:${state}`, load.webhookUrl, 'EX', 3600);
-      await ioRedis.set(`redirect:${state}`, load.redirectUrl, 'EX', 3600);
-      await ioRedis.set(`organization:${state}`, org.id, 'EX', 3600);
-      await ioRedis.set(`login:${state}`, codeVerifier, 'EX', 3600);
+      await stateStore.set(`webhookUrl:${state}`, load.webhookUrl, 'EX', 3600);
+      await stateStore.set(`redirect:${state}`, load.redirectUrl, 'EX', 3600);
+      await stateStore.set(`organization:${state}`, org.id, 'EX', 3600);
+      await stateStore.set(`login:${state}`, codeVerifier, 'EX', 3600);
 
       return url;
     } catch (err) {}

@@ -7,7 +7,7 @@ import {
   Post,
   UseFilters,
 } from '@nestjs/common';
-import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
+import { stateStore } from '@gitroom/nestjs-libraries/state/postgres.state';
 import { ConnectIntegrationDto } from '@gitroom/nestjs-libraries/dtos/integrations/connect.integration.dto';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
@@ -60,7 +60,7 @@ export class NoAuthIntegrationsController {
 
     const getCodeVerifier = integrationProvider.customFields
       ? 'none'
-      : await ioRedis.get(`login:${body.state}`);
+      : await stateStore.consume(`login:${body.state}`);
     if (!getCodeVerifier) {
       // The state expires after an hour and is deleted once used (page reload)
       throw new HttpException(
@@ -69,7 +69,7 @@ export class NoAuthIntegrationsController {
       );
     }
 
-    const organization = await ioRedis.get(`organization:${body.state}`);
+    const organization = await stateStore.get(`organization:${body.state}`);
     if (!organization) {
       throw new Error('Organization not found');
     }
@@ -77,25 +77,25 @@ export class NoAuthIntegrationsController {
     const org = await this._organizationService.getOrgById(organization);
 
     if (!integrationProvider.customFields) {
-      await ioRedis.del(`login:${body.state}`);
+      await stateStore.del(`login:${body.state}`);
     }
 
     const details = integrationProvider.externalUrl
-      ? await ioRedis.get(`external:${body.state}`)
+      ? await stateStore.get(`external:${body.state}`)
       : undefined;
 
     if (details) {
-      await ioRedis.del(`external:${body.state}`);
+      await stateStore.del(`external:${body.state}`);
     }
 
-    const refresh = await ioRedis.get(`refresh:${body.state}`);
+    const refresh = await stateStore.get(`refresh:${body.state}`);
     if (refresh) {
-      await ioRedis.del(`refresh:${body.state}`);
+      await stateStore.del(`refresh:${body.state}`);
     }
 
-    const onboarding = await ioRedis.get(`onboarding:${body.state}`);
+    const onboarding = await stateStore.get(`onboarding:${body.state}`);
     if (onboarding) {
-      await ioRedis.del(`onboarding:${body.state}`);
+      await stateStore.del(`onboarding:${body.state}`);
     }
 
     const {
@@ -297,7 +297,7 @@ export class NoAuthIntegrationsController {
       }
     }
 
-    const webhookUrl = await ioRedis.get(`webhookUrl:${body.state}`);
+    const webhookUrl = await stateStore.get(`webhookUrl:${body.state}`);
     if (webhookUrl) {
       try {
         await fetch(webhookUrl, {
@@ -313,12 +313,12 @@ export class NoAuthIntegrationsController {
         });
       } catch (err) {}
 
-      await ioRedis.del(`webhookUrl:${body.state}`);
+      await stateStore.del(`webhookUrl:${body.state}`);
     }
 
-    const returnURL = await ioRedis.get(`redirect:${body.state}`);
+    const returnURL = await stateStore.get(`redirect:${body.state}`);
     if (returnURL) {
-      await ioRedis.del(`redirect:${body.state}`);
+      await stateStore.del(`redirect:${body.state}`);
     }
 
     const extensionToken = integrationProvider.isChromeExtension
@@ -355,7 +355,7 @@ export class NoAuthIntegrationsController {
       throw new Error('Invalid state');
     }
 
-    const organization = await ioRedis.get(`organization:${body.state}`);
+    const organization = await stateStore.get(`organization:${body.state}`);
     if (!organization) {
       throw new Error('Organization not found');
     }

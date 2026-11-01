@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { AutopostRepository } from '@gitroom/nestjs-libraries/database/prisma/autopost/autopost.repository';
 import { AutopostDto } from '@gitroom/nestjs-libraries/dtos/autopost/autopost.dto';
 import dayjs from 'dayjs';
@@ -14,11 +14,6 @@ import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/po
 import Parser from 'rss-parser';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
-import { TemporalService } from 'nestjs-temporal-core';
-import { TypedSearchAttributes } from '@temporalio/common';
-import {
-  organizationId,
-} from '@gitroom/nestjs-libraries/temporal/temporal.search.attribute';
 const parser = new Parser();
 
 interface WorkflowChannelsState {
@@ -62,7 +57,6 @@ const dallePrompt = z.object({
 export class AutopostService {
   constructor(
     private _autopostsRepository: AutopostRepository,
-    private _temporalService: TemporalService,
     private _integrationService: IntegrationService,
     private _postsService: PostsService
   ) {}
@@ -79,6 +73,10 @@ export class AutopostService {
   }
 
   async createAutopost(orgId: string, body: AutopostDto, id?: string) {
+    if (body.active)
+      throw new ServiceUnavailableException(
+        'RSS autopost is disabled in the internal runtime'
+      );
     const data = await this._autopostsRepository.createAutopost(
       orgId,
       body,
@@ -91,6 +89,10 @@ export class AutopostService {
   }
 
   async changeActive(orgId: string, id: string, active: boolean) {
+    if (active)
+      throw new ServiceUnavailableException(
+        'RSS autopost is disabled in the internal runtime'
+      );
     const data = await this._autopostsRepository.changeActive(
       orgId,
       id,
@@ -101,34 +103,11 @@ export class AutopostService {
   }
 
   async processCron(active: boolean, orgId: string, id: string) {
-    if (active) {
-      try {
-        return await this._temporalService.client
-          .getRawClient()
-          ?.workflow.start('autoPostWorkflow', {
-            workflowId: `autopost-${id}`,
-            taskQueue: 'main',
-            args: [{ id, immediately: true }],
-            // Keep a running workflow, it reads the autopost settings on every run
-            workflowIdConflictPolicy: 'USE_EXISTING',
-            typedSearchAttributes: new TypedSearchAttributes([
-              {
-                key: organizationId,
-                value: orgId,
-              },
-            ]),
-          });
-      } catch (err) {
-        // Don't fall through and terminate an active autopost
-        return false;
-      }
-    }
-
-    try {
-      return await this._temporalService.terminateWorkflow(`autopost-${id}`);
-    } catch (err) {
-      return false;
-    }
+    if (active)
+      throw new ServiceUnavailableException(
+        'RSS autopost is disabled in the internal runtime'
+      );
+    return true;
   }
 
   async deleteAutopost(orgId: string, id: string) {
@@ -272,43 +251,47 @@ export class AutopostService {
       state.integrations[0].organizationId
     );
 
-    await this._postsService.createPost(state.integrations[0].organizationId, {
-      date: nextTime + 'Z',
-      order: makeId(10),
-      shortLink: false,
-      type: 'draft',
-      tags: [],
-      posts: state.integrations.map((i) => ({
-        settings: {
-          __type: i.providerIdentifier as any,
-          title: '',
-          tags: [],
-          subreddit: [],
-        },
-        group: makeId(10),
-        integration: { id: i.id },
-        value: [
-          {
-            id: makeId(10),
-            delay: 0,
-            content:
-              state.description.replace(/\n/g, '\n\n') +
-              '\n\n' +
-              state.load.url,
-            image: !state.image
-              ? []
-              : [
-                  {
-                    id: makeId(10),
-                    name: makeId(10),
-                    path: state.image,
-                    organizationId: state.integrations[0].organizationId,
-                  },
-                ],
+    await this._postsService.createPost(
+      state.integrations[0].organizationId,
+      {
+        date: nextTime + 'Z',
+        order: makeId(10),
+        shortLink: false,
+        type: 'draft',
+        tags: [],
+        posts: state.integrations.map((i) => ({
+          settings: {
+            __type: i.providerIdentifier as any,
+            title: '',
+            tags: [],
+            subreddit: [],
           },
-        ],
-      })),
-    }, 'AUTOPOST');
+          group: makeId(10),
+          integration: { id: i.id },
+          value: [
+            {
+              id: makeId(10),
+              delay: 0,
+              content:
+                state.description.replace(/\n/g, '\n\n') +
+                '\n\n' +
+                state.load.url,
+              image: !state.image
+                ? []
+                : [
+                    {
+                      id: makeId(10),
+                      name: makeId(10),
+                      path: state.image,
+                      organizationId: state.integrations[0].organizationId,
+                    },
+                  ],
+            },
+          ],
+        })),
+      },
+      'AUTOPOST'
+    );
   }
 
   async updateUrl(state: WorkflowChannelsState) {

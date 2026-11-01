@@ -13,14 +13,11 @@ import {
   Sections,
   SubscriptionException,
 } from '@gitroom/backend/services/auth/permissions/permission.exception.class';
-import { TemporalService } from 'nestjs-temporal-core';
-import { TypedSearchAttributes } from '@temporalio/common';
-import { organizationId } from '@gitroom/nestjs-libraries/temporal/temporal.search.attribute';
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { MediaProcessorJob } from '@gitroom/nestjs-libraries/upload/media.processor.interface';
 import { extname } from 'path';
 import { randomBytes } from 'crypto';
-import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
+import { stateStore } from '@gitroom/nestjs-libraries/state/postgres.state';
 import { ssrfSafeDispatcher } from '@gitroom/nestjs-libraries/dtos/webhooks/ssrf.safe.dispatcher';
 import {
   getMaxSize,
@@ -90,8 +87,7 @@ export class MediaService {
     private _mediaRepository: MediaRepository,
     private _openAi: OpenaiService,
     private _subscriptionService: SubscriptionService,
-    private _videoManager: VideoManager,
-    private _temporalService: TemporalService
+    private _videoManager: VideoManager
   ) {}
 
   async deleteMedia(org: string, id: string) {
@@ -187,40 +183,14 @@ export class MediaService {
     filePath: string,
     originalName?: string
   ) {
-    const media = await this.saveFile(org, fileName, filePath, originalName);
-    const client = this._temporalService.client.getRawClient();
-    if (
-      !this.processor ||
-      !PROCESSABLE[extname(fileName).toLowerCase()] ||
-      !client
-    ) {
-      return media;
-    }
-
-    await this._mediaRepository.startProcessing(org, media.id);
-    try {
-      await client.workflow.start('processMediaWorkflow', {
-        workflowId: `media_${media.id}`,
-        taskQueue: 'main',
-        args: [{ mediaId: media.id }],
-        typedSearchAttributes: new TypedSearchAttributes([
-          {
-            key: organizationId,
-            value: org,
-          },
-        ]),
-      });
-    } catch (err) {
-      // no workflow means nothing will ever flip the status
-      return this.releaseUnprocessed(org, media.id, media.name);
-    }
-
-    return { ...media, status: 'processing' };
+    if (this.processor)
+      throw new HttpException(
+        'Managed normalization is disabled in the internal runtime. Upload a platform-ready MP4 or image.',
+        503
+      );
+    return this.saveFile(org, fileName, filePath, originalName);
   }
 
-  // Lets go of a media the normalizer will not touch. A source the platforms
-  // accept as-is (mp4, png, ...) becomes ready; one that only exists to be
-  // converted (mov) is failed, since nothing downstream can use it
   private async releaseUnprocessed(org: string, id: string, name: string) {
     const convertOnly = !USABLE_AS_IS.has(extname(name).toLowerCase());
     await this._mediaRepository.finishProcessing(org, id, {
@@ -236,12 +206,12 @@ export class MediaService {
   // widget only, so it doesn't end up in the conversation
   async createUploadSession(org: string) {
     const sessionId = randomBytes(16).toString('hex');
-    await ioRedis.set(`uploadSession:${sessionId}`, org, 'EX', 3600);
+    await stateStore.set(`uploadSession:${sessionId}`, org, 'EX', 3600);
     return sessionId;
   }
 
   private async checkUploadSession(org: string, sessionId: string) {
-    if ((await ioRedis.get(`uploadSession:${sessionId}`)) !== org) {
+    if ((await stateStore.get(`uploadSession:${sessionId}`)) !== org) {
       throw new HttpException('Upload session not found or expired', 404);
     }
   }
@@ -249,7 +219,7 @@ export class MediaService {
   async createUploadTicket(org: string, sessionId: string) {
     await this.checkUploadSession(org, sessionId);
     const ticket = randomBytes(32).toString('hex');
-    await ioRedis.set(
+    await stateStore.set(
       `uploadTicket:${ticket}`,
       JSON.stringify({ org, sessionId }),
       'EX',
@@ -262,11 +232,11 @@ export class MediaService {
   // after this check, so an expired session has to be refused here
   async getUploadTicket(ticket: string) {
     const found = JSON.parse(
-      (await ioRedis.get(`uploadTicket:${ticket}`)) || 'null'
+      (await stateStore.get(`uploadTicket:${ticket}`)) || 'null'
     ) as { org: string; sessionId: string } | null;
     if (
       !found ||
-      (await ioRedis.get(`uploadSession:${found.sessionId}`)) !== found.org
+      (await stateStore.get(`uploadSession:${found.sessionId}`)) !== found.org
     ) {
       return null;
     }
@@ -286,14 +256,18 @@ export class MediaService {
       ? await this.saveUploadedFile(org, fileName, filePath, originalName)
       : await this.saveFile(org, fileName, filePath, originalName);
     // a list, so parallel uploads of the same session can't overwrite each other
-    await ioRedis.rpush(`uploadSessionMedia:${sessionId}`, media.id);
-    await ioRedis.expire(`uploadSessionMedia:${sessionId}`, 3600);
+    await stateStore.rpush(`uploadSessionMedia:${sessionId}`, media.id);
+    await stateStore.expire(`uploadSessionMedia:${sessionId}`, 3600);
     return media;
   }
 
   async getUploadSession(org: string, sessionId: string) {
     await this.checkUploadSession(org, sessionId);
-    const list = await ioRedis.lrange(`uploadSessionMedia:${sessionId}`, 0, -1);
+    const list = await stateStore.lrange(
+      `uploadSessionMedia:${sessionId}`,
+      0,
+      -1
+    );
     return (
       await Promise.all(
         list.map((id) => this._mediaRepository.getMediaStatus(org, id))
@@ -572,38 +546,14 @@ export class MediaService {
 
   // Generating a video takes minutes, longer than an MCP request can stay open,
   // so the generation runs in a workflow and the caller polls its status by job id
-  async startGenerateVideo(org: Organization, body: VideoDto) {
-    // validated here as well as in the workflow so bad input fails before a job exists
-    try {
-      await this.validateVideoRequest(org, body);
-    } catch (err) {
-      throw generationError(err);
-    }
-
-    const client = this._temporalService.client.getRawClient();
-    if (!client) {
-      throw new HttpException('Video generation is not available', 503);
-    }
-
-    const jobId = `video_${org.id}_${makeId(10)}`;
-    await client.workflow.start('generateVideoWorkflow', {
-      workflowId: jobId,
-      taskQueue: 'main',
-      args: [
-        {
-          organizationId: org.id,
-          body,
-        },
-      ],
-      typedSearchAttributes: new TypedSearchAttributes([
-        {
-          key: organizationId,
-          value: org.id,
-        },
-      ]),
-    });
-
-    return { jobId };
+  async startGenerateVideo(
+    org: Organization,
+    body: VideoDto
+  ): Promise<{ jobId: string }> {
+    throw new HttpException(
+      'AI video generation is disabled in the internal runtime',
+      503
+    );
   }
 
   async getGenerateVideoStatus(
@@ -615,39 +565,10 @@ export class MediaService {
     path?: string;
     error?: string;
   }> {
-    // the job id carries the organization, so one org can't poll another's job
-    if (!jobId.startsWith(`video_${org.id}_`)) {
-      throw new HttpException('Video job not found', 404);
-    }
-
-    const handle = await this._temporalService.client.getWorkflowHandle(jobId);
-    let status: string;
-    try {
-      status = (await handle.describe()).status.name;
-    } catch (err) {
-      throw new HttpException('Video job not found', 404);
-    }
-
-    if (status === 'RUNNING') {
-      return { status: 'pending' };
-    }
-
-    try {
-      const media = (await handle.result()) as Awaited<
-        ReturnType<MediaService['saveFile']>
-      >;
-      return { status: 'completed', id: media.id, path: media.path };
-    } catch (err) {
-      // the workflow failure wraps the activity failure which wraps the actual error
-      let cause: any = err;
-      while (cause?.cause && cause.cause !== cause) {
-        cause = cause.cause;
-      }
-      return {
-        status: 'failed',
-        error: cause?.message || String(err),
-      };
-    }
+    throw new HttpException(
+      'AI video generation is disabled in the internal runtime',
+      503
+    );
   }
 
   async videoFunction(identifier: string, functionName: string, body: any) {

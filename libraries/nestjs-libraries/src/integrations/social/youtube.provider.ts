@@ -1,5 +1,7 @@
 import {
   AnalyticsData,
+  PostInsights,
+  PostInsightMetric,
   AuthTokenDetails,
   PendingCheckResponse,
   PostDetails,
@@ -247,7 +249,7 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       return {
         type: 'bad-body',
         value:
-          'Your video was uploaded to YouTube successfully, but we could not set the thumbnail: custom thumbnails require a phone-verified YouTube channel. Verify your channel at youtube.com/verify, and set this video\'s thumbnail manually in YouTube Studio.',
+          "Your video was uploaded to YouTube successfully, but we could not set the thumbnail: custom thumbnails require a phone-verified YouTube channel. Verify your channel at youtube.com/verify, and set this video's thumbnail manually in YouTube Studio.",
       };
     }
 
@@ -1024,6 +1026,143 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
     } catch (err) {
       return [];
     }
+  }
+
+  async postInsights(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    days: number
+  ): Promise<PostInsights> {
+    const { client, youtubeAnalytics } = clientAndYoutube();
+    client.setCredentials({ access_token: accessToken });
+    const api = youtubeAnalytics(client);
+    const startDate = dayjs().subtract(days, 'day').format('YYYY-MM-DD');
+    const endDate = dayjs().format('YYYY-MM-DD');
+    const common = {
+      ids: `channel==${integrationId}`,
+      startDate,
+      endDate,
+      filters: `video==${postId}`,
+    };
+    const definitions: Array<[string, string, PostInsightMetric['unit']]> = [
+      ['views', 'Views in selected period', 'count'],
+      ['engagedViews', 'Engaged views', 'count'],
+      ['estimatedMinutesWatched', 'Watch time', 'minutes'],
+      ['averageViewDuration', 'Average view duration', 'seconds'],
+      ['averageViewPercentage', 'Average percentage viewed', 'percent'],
+      ['likes', 'Likes in selected period', 'count'],
+      ['comments', 'Comments in selected period', 'count'],
+      ['shares', 'Shares in selected period', 'count'],
+      ['subscribersGained', 'Subscribers gained', 'count'],
+    ];
+    const metrics: PostInsightMetric[] = [];
+    // Isolated requests keep newer/unsupported metrics from breaking the rest.
+    for (const [key, label, unit] of definitions) {
+      try {
+        const response = await api.reports.query(
+          { ...common, metrics: key },
+          { timeout: 30000 }
+        );
+        const raw = response.data.rows?.[0]?.[0];
+        const value =
+          typeof raw === 'number' && Number.isFinite(raw) ? raw : null;
+        metrics.push({
+          key,
+          label,
+          value,
+          unit,
+          source: `youtube.analytics.${key}`,
+          period: 'selected_range',
+          ...(value === null
+            ? { unavailable: 'No report data available yet' }
+            : {}),
+        });
+      } catch (error: any) {
+        if (error?.response?.status === 401)
+          throw new RefreshToken(
+            this.identifier,
+            '{}',
+            '{}',
+            'Reconnect YouTube'
+          );
+        if (error?.response?.status === 429 || error?.response?.status >= 500)
+          throw new Error('YouTube analytics temporarily unavailable');
+        metrics.push({
+          key,
+          label,
+          value: null,
+          unit,
+          source: `youtube.analytics.${key}`,
+          period: 'selected_range',
+          unavailable:
+            'Metric unavailable for this video or granted permissions',
+        });
+      }
+    }
+    const views = metrics.find((m) => m.key === 'views')?.value;
+    const likes = metrics.find((m) => m.key === 'likes')?.value;
+    metrics.push({
+      key: 'likes_per_100_views',
+      label: 'Likes per 100 views',
+      value:
+        views > 0 && likes !== null && likes !== undefined
+          ? (likes / views) * 100
+          : null,
+      unit: 'percent',
+      period: 'selected_range',
+      source: 'derived:likes/views*100',
+    });
+    let retention: PostInsights['retention'] = [];
+    let retentionUnavailable: string | undefined;
+    try {
+      const response = await api.reports.query(
+        {
+          ...common,
+          dimensions: 'elapsedVideoTimeRatio',
+          metrics: 'audienceWatchRatio,relativeRetentionPerformance',
+        },
+        { timeout: 30000 }
+      );
+      const headers = response.data.columnHeaders?.map((h) => h.name) || [];
+      retention = (response.data.rows || [])
+        .map((row) => ({
+          elapsedRatio: Number(row[headers.indexOf('elapsedVideoTimeRatio')]),
+          audienceWatchRatio: Number(
+            row[headers.indexOf('audienceWatchRatio')]
+          ),
+          ...(headers.includes('relativeRetentionPerformance')
+            ? {
+                relativePerformance: Number(
+                  row[headers.indexOf('relativeRetentionPerformance')]
+                ),
+              }
+            : {}),
+        }))
+        .filter(
+          (p) =>
+            Number.isFinite(p.elapsedRatio) &&
+            p.elapsedRatio >= 0 &&
+            p.elapsedRatio <= 1 &&
+            Number.isFinite(p.audienceWatchRatio)
+        );
+      if (!retention.length)
+        retentionUnavailable =
+          'YouTube has not returned retention data for this video and period.';
+    } catch (error: any) {
+      if (error?.response?.status === 401)
+        throw new RefreshToken(
+          this.identifier,
+          '{}',
+          '{}',
+          'Reconnect YouTube'
+        );
+      if (error?.response?.status === 429 || error?.response?.status >= 500)
+        throw new Error('YouTube retention temporarily unavailable');
+      retentionUnavailable =
+        'Retention report unavailable for this video or granted permissions.';
+    }
+    return { metrics, retention, retentionUnavailable, startDate, endDate };
   }
 
   async postAnalytics(

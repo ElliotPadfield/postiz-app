@@ -1,5 +1,14 @@
+import { InsightsRepository } from './insights/insights.repository';
+import { InsightsService } from './insights/insights.service';
+import { InternalJobsRepository } from './internal-jobs/internal.jobs.repository';
+import { InternalJobsService } from './internal-jobs/internal.jobs.service';
+import { PostgresWorker } from './internal-jobs/postgres.worker';
 import { Global, Module } from '@nestjs/common';
-import { PrismaRepository, PrismaService, PrismaTransaction } from './prisma.service';
+import {
+  PrismaRepository,
+  PrismaService,
+  PrismaTransaction,
+} from './prisma.service';
 import { OrganizationRepository } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.repository';
 import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
 import { UsersService } from '@gitroom/nestjs-libraries/database/prisma/users/users.service';
@@ -57,6 +66,11 @@ import { AdminStatsService } from '@gitroom/nestjs-libraries/database/prisma/adm
   controllers: [],
   providers: [
     PrismaService,
+    InternalJobsRepository,
+    InternalJobsService,
+    PostgresWorker,
+    InsightsRepository,
+    InsightsService,
     PrismaRepository,
     PrismaTransaction,
     UsersService,

@@ -39,15 +39,9 @@ import { resolve, sep } from 'path';
 import { OpenaiService } from '@gitroom/nestjs-libraries/openai/openai.service';
 dayjs.extend(utc);
 import * as Sentry from '@sentry/nestjs';
-import { TemporalService } from 'nestjs-temporal-core';
-import { TypedSearchAttributes } from '@temporalio/common';
-import {
-  organizationId,
-  postId as postIdSearchParam,
-} from '@gitroom/nestjs-libraries/temporal/temporal.search.attribute';
 import { AnalyticsData } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
 import { timer } from '@gitroom/helpers/utils/timer';
-import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
+import { stateStore } from '@gitroom/nestjs-libraries/state/postgres.state';
 import { RefreshToken } from '@gitroom/nestjs-libraries/integrations/social.abstract';
 import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
 import { hasExtension } from '@gitroom/helpers/utils/has.extension';
@@ -74,7 +68,6 @@ export class PostsService {
     private _mediaService: MediaService,
     private _shortLinkService: ShortLinkService,
     private _openaiService: OpenaiService,
-    private _temporalService: TemporalService,
     private _refreshIntegrationService: RefreshIntegrationService
   ) {}
 
@@ -162,6 +155,26 @@ export class PostsService {
 
   async getPostById(postId: string, orgId: string) {
     return this._postRepository.getPostById(postId, orgId);
+  }
+
+  async getPublishingStatus(orgId: string, postId: string) {
+    if (!(await this._postRepository.getPostById(postId, orgId)))
+      throw new NotFoundException('Post not found');
+    return this._postRepository.getPublishingStatus(orgId, postId);
+  }
+
+  confirmPublished(
+    orgId: string,
+    postId: string,
+    releaseId: string,
+    releaseURL: string
+  ) {
+    return this._postRepository.confirmPublished(
+      orgId,
+      postId,
+      releaseId,
+      releaseURL
+    );
   }
 
   async getPostTimeline(postId: string, orgId: string) {
@@ -358,7 +371,7 @@ export class PostsService {
       }
     }
 
-    // const getIntegrationData = await ioRedis.get(
+    // const getIntegrationData = await stateStore.get(
     //   `integration:${orgId}:${post.id}:${date}`
     // );
     // if (getIntegrationData) {
@@ -374,7 +387,7 @@ export class PostsService {
         releaseId,
         date
       );
-      await ioRedis.set(
+      await stateStore.set(
         `integration:${orgId}:${post.id}:${date}`,
         JSON.stringify(loadAnalytics),
         'EX',
@@ -613,9 +626,7 @@ export class PostsService {
 
       return getImageList;
     } catch (err: any) {
-      return (imagesList || []).filter((m) =>
-        this.isAllowedMediaPath(m?.path)
-      );
+      return (imagesList || []).filter((m) => this.isAllowedMediaPath(m?.path));
     }
   }
 
@@ -896,34 +907,7 @@ export class PostsService {
   async deletePost(orgId: string, group: string) {
     const post = await this._postRepository.deletePost(orgId, group);
 
-    if (post?.id) {
-      try {
-        const workflows = this._temporalService.client
-          .getRawClient()
-          ?.workflow.list({
-            query: `postId="${post.id}" AND ExecutionStatus="Running"`,
-          });
-
-        for await (const executionInfo of workflows) {
-          try {
-            const workflow =
-              await this._temporalService.client.getWorkflowHandle(
-                executionInfo.workflowId
-              );
-            if (
-              workflow &&
-              (await workflow.describe()).status.name !== 'TERMINATED'
-            ) {
-              await workflow.terminate();
-            }
-          } catch (err) {}
-        }
-      } catch (err) {}
-
-      return { id: post.id };
-    }
-
-    return { error: true };
+    return post?.id ? { id: post.id } : { error: true };
   }
 
   async countPostsFromDay(orgId: string, date: Date) {
@@ -940,58 +924,7 @@ export class PostsService {
     orgId: string,
     state: State
   ) {
-    try {
-      const workflows = this._temporalService.client
-        .getRawClient()
-        ?.workflow.list({
-          query: `postId="${postId}" AND ExecutionStatus="Running"`,
-        });
-
-      for await (const executionInfo of workflows) {
-        try {
-          const workflow = await this._temporalService.client.getWorkflowHandle(
-            executionInfo.workflowId
-          );
-          if (
-            workflow &&
-            (await workflow.describe()).status.name !== 'TERMINATED'
-          ) {
-            await workflow.terminate();
-          }
-        } catch (err) {}
-      }
-    } catch (err) {}
-
-    if (state === 'DRAFT') {
-      return;
-    }
-
-    try {
-      await this._temporalService.client
-        .getRawClient()
-        ?.workflow.start('postWorkflowV112', {
-          workflowId: `post_${postId}`,
-          taskQueue: 'main',
-          workflowIdConflictPolicy: 'TERMINATE_EXISTING',
-          args: [
-            {
-              taskQueue: taskQueue,
-              postId: postId,
-              organizationId: orgId,
-            },
-          ],
-          typedSearchAttributes: new TypedSearchAttributes([
-            {
-              key: postIdSearchParam,
-              value: postId,
-            },
-            {
-              key: organizationId,
-              value: orgId,
-            },
-          ]),
-        });
-    } catch (err) {}
+    return this._postRepository.syncScheduledPost(orgId, postId);
   }
 
   /**
@@ -1151,9 +1084,26 @@ export class PostsService {
     creationMethod: CreationMethod,
     keepGroup = false
   ): Promise<any[]> {
+    if (body.inter)
+      throw new BadRequestException(
+        'Repeat schedules are not enabled yet. Schedule each occurrence as a separate post.'
+      );
     const postList = [];
     const batchId = uuidv4();
     for (const post of body.posts) {
+      if (
+        Object.keys(post.settings || {}).some((key) => key.startsWith('plug-'))
+      )
+        throw new BadRequestException(
+          'Automated plugs are disabled in the internal runtime. Remove plug settings before scheduling.'
+        );
+      if (
+        (await this._integrationService.getPlugs(orgId, post.integration.id))
+          .length
+      )
+        throw new BadRequestException(
+          'Disable automated plugs for this channel before scheduling in the internal runtime'
+        );
       if (
         (body.type === 'schedule' || body.type === 'now') &&
         !body.republish &&
@@ -1206,15 +1156,6 @@ export class PostsService {
       await this.detachStaleAnchors(
         posts.filter((p) => existingIds.includes(p.id))
       );
-
-      if (body.type !== 'update') {
-        this.startWorkflow(
-          post.settings.__type.split('-')[0].toLowerCase(),
-          posts[0].id,
-          orgId,
-          posts[0].state
-        ).catch((err) => {});
-      }
 
       Sentry.metrics.count('post_created', 1);
       postList.push({
@@ -1392,16 +1333,7 @@ export class PostsService {
     }
 
     const state: State = status === 'draft' ? 'DRAFT' : 'QUEUE';
-    await this._postRepository.changeState(id, state);
-
-    try {
-      await this.startWorkflow(
-        getPostById.integration.providerIdentifier.split('-')[0].toLowerCase(),
-        getPostById.id,
-        orgId,
-        state
-      );
-    } catch (err) {}
+    await this._postRepository.setScheduledState(orgId, id, state);
 
     return { id, state };
   }
@@ -1428,19 +1360,6 @@ export class PostsService {
       getPostById.state === 'DRAFT',
       action
     );
-
-    if (action === 'schedule') {
-      try {
-        await this.startWorkflow(
-          getPostById.integration.providerIdentifier
-            .split('-')[0]
-            .toLowerCase(),
-          getPostById.id,
-          orgId,
-          getPostById.state === 'DRAFT' ? 'DRAFT' : 'QUEUE'
-        );
-      } catch (err) {}
-    }
 
     return newDate;
   }

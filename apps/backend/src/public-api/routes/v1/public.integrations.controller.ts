@@ -52,7 +52,7 @@ import { PostValidationException } from '@gitroom/backend/api/routes/posts.valid
 import { UsersService } from '@gitroom/nestjs-libraries/database/prisma/users/users.service';
 import { SuperAdminGuard } from '@gitroom/backend/services/auth/super.admin.guard';
 import { timer } from '@gitroom/helpers/utils/timer';
-import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
+import { stateStore } from '@gitroom/nestjs-libraries/state/postgres.state';
 import { AdminStatsService } from '@gitroom/nestjs-libraries/database/prisma/admin-stats/admin-stats.service';
 import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
 import { GetOrgActivityDto } from '@gitroom/nestjs-libraries/dtos/analytics/get.org.activity.dto';
@@ -382,11 +382,11 @@ export class PublicIntegrationsController {
         await integrationProvider.generateAuthUrl();
 
       if (refresh) {
-        await ioRedis.set(`refresh:${state}`, refresh, 'EX', 3600);
+        await stateStore.set(`refresh:${state}`, refresh, 'EX', 3600);
       }
 
-      await ioRedis.set(`organization:${state}`, org.id, 'EX', 3600);
-      await ioRedis.set(`login:${state}`, codeVerifier, 'EX', 3600);
+      await stateStore.set(`organization:${state}`, org.id, 'EX', 3600);
+      await stateStore.set(`login:${state}`, codeVerifier, 'EX', 3600);
 
       return { url };
     } catch (err) {

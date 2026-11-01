@@ -1,4 +1,9 @@
-import { forwardRef, Inject, Injectable } from '@nestjs/common';
+import {
+  ConflictException,
+  forwardRef,
+  Inject,
+  Injectable,
+} from '@nestjs/common';
 import { Integration } from '@prisma/client';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
@@ -6,7 +11,10 @@ import {
   AuthTokenDetails,
   SocialProvider,
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
-import { TemporalService } from 'nestjs-temporal-core';
+import { InternalJobsService } from '../database/prisma/internal-jobs/internal.jobs.service';
+import { stateStore } from '../state/postgres.state';
+import { randomUUID } from 'node:crypto';
+import { timer } from '@gitroom/helpers/utils/timer';
 
 @Injectable()
 export class RefreshIntegrationService {
@@ -14,14 +22,85 @@ export class RefreshIntegrationService {
     private _integrationManager: IntegrationManager,
     @Inject(forwardRef(() => IntegrationService))
     private _integrationService: IntegrationService,
-    private _temporalService: TemporalService
+    private _jobs: InternalJobsService
   ) {}
-  async refresh(integration: Integration, cause = ''): Promise<false | AuthTokenDetails> {
+  async refresh(
+    integration: Integration,
+    cause = ''
+  ): Promise<false | AuthTokenDetails> {
+    const lockKey = `refreshLock:${integration.id}`;
+    const owner = randomUUID();
+    if (!(await stateStore.set(lockKey, owner, 'EX', 600, 'NX'))) {
+      for (let attempt = 0; attempt < 30; attempt++) {
+        await timer(1000);
+        const latest = await this._integrationService.getIntegrationById(
+          integration.organizationId,
+          integration.id
+        );
+        if (!latest || latest.refreshNeeded || latest.deletedAt) return false;
+        if (this.tokenAdvanced(integration, latest))
+          return this.currentTokenDetails(latest);
+        if (!(await stateStore.get(lockKey)))
+          return this.refresh(latest, cause);
+      }
+      throw new Error('Channel renewal is already in progress');
+    }
+    try {
+      // The caller may have read its row before a previous lock owner renewed
+      // it, even if this call acquires without contention. Never rotate a stale
+      // refresh token after winning the lock.
+      const latest = await this._integrationService.getIntegrationById(
+        integration.organizationId,
+        integration.id
+      );
+      if (!latest || latest.refreshNeeded || latest.deletedAt) return false;
+      if (this.tokenAdvanced(integration, latest))
+        return this.currentTokenDetails(latest);
+      return await this.refreshExclusive(latest, cause);
+    } finally {
+      await stateStore.delIfValue(lockKey, owner);
+    }
+  }
+
+  private tokenAdvanced(previous: Integration, current: Integration) {
+    return (
+      current.token !== previous.token ||
+      current.refreshToken !== previous.refreshToken ||
+      (current.tokenExpiration &&
+        current.tokenExpiration.getTime() >
+          (previous.tokenExpiration?.getTime() || 0))
+    );
+  }
+
+  private currentTokenDetails(channel: Integration): AuthTokenDetails {
+    return {
+      id: channel.internalId,
+      name: channel.name,
+      username: channel.name,
+      accessToken: channel.token,
+      refreshToken: channel.refreshToken,
+      expiresIn: channel.tokenExpiration
+        ? Math.max(
+            0,
+            Math.floor((channel.tokenExpiration.getTime() - Date.now()) / 1000)
+          )
+        : undefined,
+    };
+  }
+
+  private async refreshExclusive(
+    integration: Integration,
+    cause: string
+  ): Promise<false | AuthTokenDetails> {
     const socialProvider = this._integrationManager.getSocialIntegration(
       integration.providerIdentifier
     );
 
-    const refresh = await this.refreshProcess(integration, socialProvider, cause);
+    const refresh = await this.refreshProcess(
+      integration,
+      socialProvider,
+      cause
+    );
 
     if (!refresh) {
       return false as const;
@@ -53,19 +132,39 @@ export class RefreshIntegrationService {
     );
   }
 
-  public async startRefreshWorkflow(orgId: string, id: string, integration: SocialProvider) {
+  public async startRefreshWorkflow(
+    orgId: string,
+    id: string,
+    integration: SocialProvider
+  ) {
     if (!integration.refreshCron) {
       return false;
     }
 
-    return this._temporalService.client
-      .getRawClient()
-      ?.workflow.start(`refreshTokenWorkflow`, {
-        workflowId: `refresh_${id}`,
-        args: [{integrationId: id, organizationId: orgId}],
-        taskQueue: 'main',
-        workflowIdConflictPolicy: 'TERMINATE_EXISTING',
-      });
+    const channel = await this._integrationService.getIntegrationById(
+      orgId,
+      id
+    );
+    if (!channel?.tokenExpiration || channel.deletedAt || channel.refreshNeeded)
+      return false;
+    // Renewal is collected by the worker sweep as well, so a concurrent running
+    // refresh must not turn a successful OAuth reconnect into an error.
+    try {
+      return await this._jobs.schedule(
+        orgId,
+        id,
+        'REFRESH',
+        new Date(
+          Math.max(
+            Date.now(),
+            new Date(channel.tokenExpiration).getTime() - 3600_000
+          )
+        )
+      );
+    } catch (error) {
+      if (error instanceof ConflictException) return false;
+      throw error;
+    }
   }
 
   private async refreshProcess(

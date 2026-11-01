@@ -56,6 +56,9 @@ try {
     ],
     env
   );
+  if (process.env.POSTIZ_TEST_BOOT === 'true') {
+    run(process.execPath, ['scripts/smoke-internal-backend.mjs'], env);
+  }
 } catch (error) {
   console.error(error.message);
   process.exitCode = 1;

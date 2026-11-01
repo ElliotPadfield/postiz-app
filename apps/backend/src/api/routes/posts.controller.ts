@@ -34,6 +34,7 @@ import {
   ResolveCommentDto,
 } from '@gitroom/nestjs-libraries/dtos/comments/add.comment.dto';
 import { RealIP } from 'nestjs-real-ip';
+import { ConfirmPublishedDto } from '@gitroom/nestjs-libraries/dtos/posts/confirm.published.dto';
 
 @ApiTags('Posts')
 @Controller('/posts')
@@ -50,6 +51,29 @@ export class PostsController {
     @Param('id') id: string
   ) {
     return this._postsService.getStatistics(org.id, id);
+  }
+
+  @Get('/:id/publishing')
+  getPublishingStatus(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string
+  ) {
+    return this._postsService.getPublishingStatus(org.id, id);
+  }
+
+  @Put('/:id/publishing/confirm')
+  @CheckPolicies([AuthorizationActions.Update, Sections.POSTS_PER_MONTH])
+  confirmPublished(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Body() body: ConfirmPublishedDto
+  ) {
+    return this._postsService.confirmPublished(
+      org.id,
+      id,
+      body.releaseId,
+      body.releaseURL
+    );
   }
 
   @Get('/:id/missing')

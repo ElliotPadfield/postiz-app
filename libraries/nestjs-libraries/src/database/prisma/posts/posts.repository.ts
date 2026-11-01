@@ -1,5 +1,7 @@
 import { PrismaRepository } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
-import { Injectable } from '@nestjs/common';
+import { ConflictException, Injectable } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+import { PrismaService } from '../prisma.service';
 import { Post as PostBody } from '@gitroom/nestjs-libraries/dtos/posts/create.post.dto';
 import {
   APPROVED_SUBMIT_FOR_ORDER,
@@ -30,8 +32,140 @@ export class PostsRepository {
     private _comments: PrismaRepository<'comments'>,
     private _tags: PrismaRepository<'tags'>,
     private _tagsPosts: PrismaRepository<'tagsPosts'>,
-    private _errors: PrismaRepository<'errors'>
+    private _errors: PrismaRepository<'errors'>,
+    private _db: PrismaService
   ) {}
+
+  private async lockPostJobs(
+    tx: Prisma.TransactionClient,
+    where: Prisma.PostWhereInput
+  ) {
+    const posts = await tx.post.findMany({ where, select: { id: true } });
+    const ids = posts.map((p) => p.id);
+    // Lock/fence before changing a post so a racing worker must retry its claim.
+    await tx.internalJob.updateMany({
+      where: { kind: 'PUBLISH', targetId: { in: ids } },
+      data: { version: { increment: 1 } },
+    });
+    const blocked = await tx.internalJob.findFirst({
+      where: {
+        kind: 'PUBLISH',
+        targetId: { in: ids },
+        state: { in: ['RUNNING', 'REVIEW'] },
+      },
+    });
+    const processing = await tx.postExecution.findFirst({
+      where: { postId: { in: ids }, phase: { in: ['PENDING', 'MUTATING'] } },
+    });
+    if (blocked || processing)
+      throw new ConflictException(
+        'Publishing is in progress or needs outcome review. Resolve it before editing this post.'
+      );
+    return ids;
+  }
+
+  private async syncPostJobs(tx: Prisma.TransactionClient, ids: string[]) {
+    const posts = await tx.post.findMany({ where: { id: { in: ids } } });
+    for (const post of posts) {
+      const key = {
+        organizationId: post.organizationId,
+        kind: 'PUBLISH' as const,
+        targetId: post.id,
+      };
+      const existing = await tx.internalJob.findUnique({
+        where: { organizationId_kind_targetId: key },
+      });
+      if (post.deletedAt || post.parentPostId || post.state !== 'QUEUE') {
+        await tx.internalJob.updateMany({
+          where: { ...key, state: 'QUEUED' },
+          data: { state: 'CANCELLED' },
+        });
+        continue;
+      }
+      if (
+        existing &&
+        ['COMPLETED', 'REVIEW', 'RUNNING'].includes(existing.state)
+      )
+        throw new ConflictException(
+          'This post has a completed or unconfirmed publishing attempt. Create a new post for a deliberate repost.'
+        );
+      await tx.internalJob.upsert({
+        where: { organizationId_kind_targetId: key },
+        create: { ...key, runAt: post.publishDate },
+        update: {
+          state: 'QUEUED',
+          runAt: post.publishDate,
+          version: { increment: 1 },
+          failureCode: null,
+          attempts: 0,
+        },
+      });
+    }
+  }
+
+  async setScheduledState(orgId: string, id: string, state: State) {
+    return this._db.$transaction(async (tx) => {
+      const ids = await this.lockPostJobs(tx, { organizationId: orgId, id });
+      const post = await tx.post.update({
+        where: { id, organizationId: orgId },
+        data: { state },
+      });
+      await this.syncPostJobs(tx, ids);
+      return post;
+    });
+  }
+
+  async syncScheduledPost(orgId: string, id: string) {
+    return this._db.$transaction(async (tx) => {
+      const ids = await this.lockPostJobs(tx, { organizationId: orgId, id });
+      await this.syncPostJobs(tx, ids);
+    });
+  }
+
+  getPublishingStatus(orgId: string, id: string) {
+    return this._db.internalJob.findFirst({
+      where: { organizationId: orgId, targetId: id, kind: 'PUBLISH' },
+      select: { state: true, failureCode: true, updatedAt: true },
+    });
+  }
+
+  async confirmPublished(
+    orgId: string,
+    id: string,
+    releaseId: string,
+    releaseURL: string
+  ) {
+    return this._db.$transaction(async (tx) => {
+      const updated = await tx.internalJob.updateMany({
+        where: {
+          organizationId: orgId,
+          targetId: id,
+          kind: 'PUBLISH',
+          state: 'REVIEW',
+        },
+        data: {
+          state: 'COMPLETED',
+          failureCode: 'MANUALLY_CONFIRMED_PUBLISHED',
+          leaseToken: null,
+          leaseExpiresAt: null,
+        },
+      });
+      if (!updated.count)
+        throw new ConflictException(
+          'This post is not awaiting publishing review'
+        );
+      await tx.post.update({
+        where: { id, organizationId: orgId, deletedAt: null },
+        data: { state: 'PUBLISHED', releaseId, releaseURL, error: null },
+      });
+      await tx.postExecution.upsert({
+        where: { postId: id },
+        create: { postId: id, phase: 'COMPLETED' },
+        update: { phase: 'COMPLETED', pendingData: Prisma.DbNull },
+      });
+      return { id, state: 'PUBLISHED' as const };
+    });
+  }
 
   searchForMissingThreeHoursPosts() {
     return this._post.model.post.findMany({
@@ -227,26 +361,26 @@ export class PostsRepository {
     return list
       .map((post) => ({ ...post, error: this.curatedError(post.error) }))
       .reduce((all, post) => {
-      if (!post.intervalInDays) {
-        return [...all, post];
-      }
-
-      const addMorePosts = [];
-      let startingDate = dayjs.utc(post.publishDate);
-      while (dayjs.utc(endDate).isSameOrAfter(startingDate)) {
-        if (dayjs(startingDate).isSameOrAfter(dayjs.utc(post.publishDate))) {
-          addMorePosts.push({
-            ...post,
-            publishDate: startingDate.toDate(),
-            actualDate: post.publishDate,
-          });
+        if (!post.intervalInDays) {
+          return [...all, post];
         }
 
-        startingDate = startingDate.add(post.intervalInDays, 'days');
-      }
+        const addMorePosts = [];
+        let startingDate = dayjs.utc(post.publishDate);
+        while (dayjs.utc(endDate).isSameOrAfter(startingDate)) {
+          if (dayjs(startingDate).isSameOrAfter(dayjs.utc(post.publishDate))) {
+            addMorePosts.push({
+              ...post,
+              publishDate: startingDate.toDate(),
+              actualDate: post.publishDate,
+            });
+          }
 
-      return [...all, ...addMorePosts];
-    }, [] as any[]);
+          startingDate = startingDate.add(post.intervalInDays, 'days');
+        }
+
+        return [...all, ...addMorePosts];
+      }, [] as any[]);
   }
 
   async getPostsList(orgId: string, query: GetPostsListDto) {
@@ -360,25 +494,29 @@ export class PostsRepository {
   }
 
   async deletePost(orgId: string, group: string) {
-    await this._post.model.post.updateMany({
-      where: {
-        organizationId: orgId,
-        group,
-      },
-      data: {
-        deletedAt: new Date(),
-      },
-    });
+    return this._db.$transaction(async (tx) => {
+      const ids = await this.lockPostJobs(tx, { organizationId: orgId, group });
+      await tx.post.updateMany({
+        where: {
+          organizationId: orgId,
+          group,
+        },
+        data: {
+          deletedAt: new Date(),
+        },
+      });
 
-    return this._post.model.post.findFirst({
-      where: {
-        organizationId: orgId,
-        group,
-        parentPostId: null,
-      },
-      select: {
-        id: true,
-      },
+      await this.syncPostJobs(tx, ids);
+      return tx.post.findFirst({
+        where: {
+          organizationId: orgId,
+          group,
+          parentPostId: null,
+        },
+        select: {
+          id: true,
+        },
+      });
     });
   }
 
@@ -561,23 +699,28 @@ export class PostsRepository {
     isDraft: boolean,
     action: 'schedule' | 'update' = 'schedule'
   ) {
-    return this._post.model.post.update({
-      where: {
-        organizationId: orgId,
-        id,
-      },
-      data: {
-        publishDate: dayjs(date).toDate(),
-        // schedule: set state to QUEUE (or DRAFT if it was a draft)
-        // update: don't change the state
-        ...(action === 'schedule'
-          ? {
-              state: isDraft ? 'DRAFT' : 'QUEUE',
-              releaseId: null,
-              releaseURL: null,
-            }
-          : {}),
-      },
+    return this._db.$transaction(async (tx) => {
+      const ids = await this.lockPostJobs(tx, { organizationId: orgId, id });
+      const post = await tx.post.update({
+        where: {
+          organizationId: orgId,
+          id,
+        },
+        data: {
+          publishDate: dayjs(date).toDate(),
+          // schedule: set state to QUEUE (or DRAFT if it was a draft)
+          // update: don't change the state
+          ...(action === 'schedule'
+            ? {
+                state: isDraft ? 'DRAFT' : 'QUEUE',
+                releaseId: null,
+                releaseURL: null,
+              }
+            : {}),
+        },
+      });
+      await this.syncPostJobs(tx, ids);
+      return post;
     });
   }
 
@@ -619,186 +762,209 @@ export class PostsRepository {
     // of them in the editor brings the others.
     batchId?: string
   ) {
-    const posts: Post[] = [];
-    const uuid = uuidv4();
-    const group = keepGroup && body.group ? body.group : uuid;
-
-    // an edited post stays in the batch it was created in, even when it is
-    // saved on its own or with a group that was rotated since
-    const ids = body.value.map((value) => value.id).filter(Boolean);
-    const existingBatchId =
-      body.group || ids.length
-        ? (
-            await this._post.model.post.findFirst({
-              where: {
-                organizationId: orgId,
-                deletedAt: null,
-                batchId: {
-                  not: null,
-                },
-                OR: [
-                  ...(body.group ? [{ group: body.group }] : []),
-                  ...(ids.length ? [{ id: { in: ids } }] : []),
-                ],
-              },
-              select: {
-                batchId: true,
-              },
-            })
-          )?.batchId
-        : undefined;
-
-    for (const value of body.value) {
-      const updateData = (type: 'create' | 'update') => ({
-        publishDate: dayjs(date).toDate(),
-        integration: {
-          connect: {
-            id: body.integration.id,
-            organizationId: orgId,
-          },
-        },
-        ...(posts?.[posts.length - 1]?.id
-          ? {
-              parentPost: {
-                connect: {
-                  id: posts[posts.length - 1]?.id,
-                },
-              },
-            }
-          : type === 'update'
-          ? {
-              parentPost: {
-                disconnect: true,
-              },
-            }
-          : {}),
-        content: value.content,
-        delay: value.delay || 0,
-        group,
-        batchId: existingBatchId || batchId,
-        intervalInDays: inter ? +inter : null,
-        approvedSubmitForOrder: APPROVED_SUBMIT_FOR_ORDER.NO,
-        ...(type === 'create' ? { creationMethod } : {}),
-        ...(state === 'update'
-          ? {}
-          : {
-              state:
-                state === 'draft' ? ('DRAFT' as const) : ('QUEUE' as const),
-            }),
-        image: JSON.stringify(value.image),
-        settings: JSON.stringify(body.settings),
-        organization: {
-          connect: {
-            id: orgId,
-          },
-        },
-      });
-
-      posts.push(
-        await this._post.model.post.upsert({
-          where: {
-            id: value.id || uuidv4(),
-          },
-          create: { ...updateData('create') },
-          update: {
-            ...updateData('update'),
-            lastMessage: {
-              disconnect: true,
-            },
-            submittedForOrder: {
-              disconnect: true,
-            },
-          },
-        })
-      );
-
-      if (posts.length === 1) {
-        await this._tagsPosts.model.tagsPosts.deleteMany({
-          where: {
-            post: {
-              id: posts[0].id,
-            },
-          },
+    return this._db.$transaction(
+      async (tx) => {
+        const inputIds = body.value.map((p) => p.id).filter(Boolean);
+        if (
+          await tx.post.count({
+            where: { id: { in: inputIds }, organizationId: { not: orgId } },
+          })
+        )
+          throw new ConflictException('Post belongs to another workspace');
+        const lockedIds = await this.lockPostJobs(tx, {
+          organizationId: orgId,
+          OR: [
+            { id: { in: inputIds } },
+            ...(body.group ? [{ group: body.group }] : []),
+          ],
         });
+        const posts: Post[] = [];
+        const uuid = uuidv4();
+        const group = keepGroup && body.group ? body.group : uuid;
 
-        if (tags.length) {
-          const tagsList = await this._tags.model.tags.findMany({
-            where: {
-              orgId: orgId,
-              deletedAt: null,
-              name: {
-                in: tags.map((tag) => tag.label).filter((f) => f),
+        // an edited post stays in the batch it was created in, even when it is
+        // saved on its own or with a group that was rotated since
+        const ids = body.value.map((value) => value.id).filter(Boolean);
+        const existingBatchId =
+          body.group || ids.length
+            ? (
+                await tx.post.findFirst({
+                  where: {
+                    organizationId: orgId,
+                    deletedAt: null,
+                    batchId: {
+                      not: null,
+                    },
+                    OR: [
+                      ...(body.group ? [{ group: body.group }] : []),
+                      ...(ids.length ? [{ id: { in: ids } }] : []),
+                    ],
+                  },
+                  select: {
+                    batchId: true,
+                  },
+                })
+              )?.batchId
+            : undefined;
+
+        for (const value of body.value) {
+          const updateData = (type: 'create' | 'update') => ({
+            publishDate: dayjs(date).toDate(),
+            integration: {
+              connect: {
+                id: body.integration.id,
+                organizationId: orgId,
+              },
+            },
+            ...(posts?.[posts.length - 1]?.id
+              ? {
+                  parentPost: {
+                    connect: {
+                      id: posts[posts.length - 1]?.id,
+                    },
+                  },
+                }
+              : type === 'update'
+              ? {
+                  parentPost: {
+                    disconnect: true,
+                  },
+                }
+              : {}),
+            content: value.content,
+            delay: value.delay || 0,
+            group,
+            batchId: existingBatchId || batchId,
+            intervalInDays: inter ? +inter : null,
+            approvedSubmitForOrder: APPROVED_SUBMIT_FOR_ORDER.NO,
+            ...(type === 'create' ? { creationMethod } : {}),
+            ...(state === 'update'
+              ? {}
+              : {
+                  state:
+                    state === 'draft' ? ('DRAFT' as const) : ('QUEUE' as const),
+                }),
+            image: JSON.stringify(value.image),
+            settings: JSON.stringify(body.settings),
+            organization: {
+              connect: {
+                id: orgId,
               },
             },
           });
 
-          if (tagsList.length) {
-            await this._post.model.post.update({
+          posts.push(
+            await tx.post.upsert({
               where: {
-                id: posts[posts.length - 1].id,
+                id: value.id || uuidv4(),
               },
-              data: {
-                tags: {
-                  createMany: {
-                    data: tagsList.map((tag) => ({
-                      tagId: tag.id,
-                    })),
-                  },
+              create: { ...updateData('create') },
+              update: {
+                ...updateData('update'),
+                lastMessage: {
+                  disconnect: true,
+                },
+                submittedForOrder: {
+                  disconnect: true,
+                },
+              },
+            })
+          );
+
+          if (posts.length === 1) {
+            await tx.tagsPosts.deleteMany({
+              where: {
+                post: {
+                  id: posts[0].id,
                 },
               },
             });
+
+            if (tags.length) {
+              const tagsList = await tx.tags.findMany({
+                where: {
+                  orgId: orgId,
+                  deletedAt: null,
+                  name: {
+                    in: tags.map((tag) => tag.label).filter((f) => f),
+                  },
+                },
+              });
+
+              if (tagsList.length) {
+                await tx.post.update({
+                  where: {
+                    id: posts[posts.length - 1].id,
+                  },
+                  data: {
+                    tags: {
+                      createMany: {
+                        data: tagsList.map((tag) => ({
+                          tagId: tag.id,
+                        })),
+                      },
+                    },
+                  },
+                });
+              }
+            }
           }
         }
-      }
-    }
 
-    const previousPost = body.group
-      ? (
-          await this._post.model.post.findFirst({
+        const previousPost = body.group
+          ? (
+              await tx.post.findFirst({
+                where: {
+                  group: body.group,
+                  organizationId: orgId,
+                  deletedAt: null,
+                  parentPostId: null,
+                },
+                select: {
+                  id: true,
+                },
+              })
+            )?.id!
+          : undefined;
+
+        if (body.group && !keepGroup) {
+          await tx.post.updateMany({
             where: {
               group: body.group,
+              organizationId: orgId,
               deletedAt: null,
+            },
+            data: {
               parentPostId: null,
+              deletedAt: new Date(),
             },
-            select: {
-              id: true,
+          });
+        }
+
+        // keepGroup: the updated rows still carry the old group, so sweep only the
+        // rows dropped from it (removed comments) by id instead of by group.
+        if (body.group && keepGroup) {
+          await tx.post.updateMany({
+            where: {
+              group: body.group,
+              organizationId: orgId,
+              deletedAt: null,
+              id: {
+                notIn: posts.map((p) => p.id),
+              },
             },
-          })
-        )?.id!
-      : undefined;
+            data: {
+              parentPostId: null,
+              deletedAt: new Date(),
+            },
+          });
+        }
 
-    if (body.group && !keepGroup) {
-      await this._post.model.post.updateMany({
-        where: {
-          group: body.group,
-          deletedAt: null,
-        },
-        data: {
-          parentPostId: null,
-          deletedAt: new Date(),
-        },
-      });
-    }
-
-    // keepGroup: the updated rows still carry the old group, so sweep only the
-    // rows dropped from it (removed comments) by id instead of by group.
-    if (body.group && keepGroup) {
-      await this._post.model.post.updateMany({
-        where: {
-          group: body.group,
-          deletedAt: null,
-          id: {
-            notIn: posts.map((p) => p.id),
-          },
-        },
-        data: {
-          parentPostId: null,
-          deletedAt: new Date(),
-        },
-      });
-    }
-
-    return { previousPost, posts };
+        await this.syncPostJobs(tx, [...lockedIds, ...posts.map((p) => p.id)]);
+        return { previousPost, posts };
+      },
+      { timeout: 15000 }
+    );
   }
 
   async submit(id: string, order: string, buyerOrganizationId: string) {

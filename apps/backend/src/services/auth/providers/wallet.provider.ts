@@ -3,9 +3,10 @@ import {
   AuthProviderAbstract,
 } from '@gitroom/backend/services/auth/providers.interface';
 import { randomBytes } from 'crypto';
-import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
+import { stateStore } from '@gitroom/nestjs-libraries/state/postgres.state';
 import bs58 from 'bs58';
 import nacl from 'tweetnacl';
+import { sign, verify } from 'jsonwebtoken';
 
 function hexToUint8Array(hex) {
   if (hex.startsWith('0x')) {
@@ -35,7 +36,7 @@ export class WalletProvider extends AuthProviderAbstract {
     }
 
     const challenge = randomBytes(32).toString('hex');
-    await ioRedis.set(`wallet:${params.publicKey}`, challenge, 'EX', 60);
+    await stateStore.set(`wallet:${params.publicKey}`, challenge, 'EX', 60);
 
     return challenge;
   }
@@ -49,7 +50,7 @@ export class WalletProvider extends AuthProviderAbstract {
       return '';
     }
 
-    const redisGet = await ioRedis.get(`wallet:${publicKey}`);
+    const redisGet = await stateStore.get(`wallet:${publicKey}`);
     if (redisGet !== challenge) {
       return '';
     }
@@ -67,20 +68,52 @@ export class WalletProvider extends AuthProviderAbstract {
       return '';
     }
 
-    return code;
+    if ((await stateStore.consume(`wallet:${publicKey}`)) !== challenge)
+      return '';
+    // OAuth login resolves the user and may then hand the same token to the
+    // registration screen. Consume the challenge once, then use a short-lived
+    // signed identity token for those two reads, as other OAuth providers do.
+    return sign(
+      { publicKey, purpose: 'wallet-login' },
+      process.env.JWT_SECRET!,
+      {
+        algorithm: 'HS256',
+        expiresIn: '5m',
+        issuer: 'postiz-wallet',
+        audience: 'postiz-auth',
+      }
+    );
   }
 
   async getUser(providerToken: string) {
-    if ((await this.getToken(providerToken)) === '') {
+    let identity: any;
+    try {
+      identity = verify(providerToken, process.env.JWT_SECRET!, {
+        algorithms: ['HS256'],
+        issuer: 'postiz-wallet',
+        audience: 'postiz-auth',
+      });
+    } catch {
+      const token = await this.getToken(providerToken).catch(() => '');
+      if (token)
+        identity = verify(token, process.env.JWT_SECRET!, {
+          algorithms: ['HS256'],
+          issuer: 'postiz-wallet',
+          audience: 'postiz-auth',
+        });
+    }
+    if (
+      !identity ||
+      identity.purpose !== 'wallet-login' ||
+      typeof identity.publicKey !== 'string'
+    ) {
       return {
         id: '',
         email: '',
       };
     }
 
-    const { publicKey } = JSON.parse(
-      Buffer.from(providerToken, 'base64').toString()
-    );
+    const { publicKey } = identity;
 
     return {
       id: String(`wallet_${publicKey}`),

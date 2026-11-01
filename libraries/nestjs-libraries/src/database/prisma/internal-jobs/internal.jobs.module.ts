@@ -3,8 +3,8 @@ import { PrismaRepository, PrismaService } from '../prisma.service';
 import { InternalJobsRepository } from './internal.jobs.repository';
 import { InternalJobsService } from './internal.jobs.service';
 
-// Intentionally opt-in until publisher/status reconciliation is wired and tested.
-// No Temporal/Redis connection, startup polling, or provider calls in this module.
+// Lightweight module for isolated queue consumers/tests. The application
+// registers the same services plus the worker in DatabaseModule.
 @Module({
   providers: [
     PrismaService,

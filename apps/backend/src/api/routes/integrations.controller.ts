@@ -8,7 +8,7 @@ import {
   Put,
   Query,
 } from '@nestjs/common';
-import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
+import { stateStore } from '@gitroom/nestjs-libraries/state/postgres.state';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
 import { GetOrgFromRequest } from '@gitroom/nestjs-libraries/user/org.from.request';
@@ -259,20 +259,20 @@ export class IntegrationsController {
         await integrationProvider.generateAuthUrl(getExternalUrl);
 
       if (refresh) {
-        await ioRedis.set(`refresh:${state}`, refresh, 'EX', 3600);
+        await stateStore.set(`refresh:${state}`, refresh, 'EX', 3600);
       }
 
       if (onboarding === 'true') {
-        await ioRedis.set(`onboarding:${state}`, 'true', 'EX', 3600);
+        await stateStore.set(`onboarding:${state}`, 'true', 'EX', 3600);
       }
 
       if (redirectUrl) {
-        await ioRedis.set(`redirect:${state}`, redirectUrl, 'EX', 3600);
+        await stateStore.set(`redirect:${state}`, redirectUrl, 'EX', 3600);
       }
 
-      await ioRedis.set(`organization:${state}`, org.id, 'EX', 3600);
-      await ioRedis.set(`login:${state}`, codeVerifier, 'EX', 3600);
-      await ioRedis.set(
+      await stateStore.set(`organization:${state}`, org.id, 'EX', 3600);
+      await stateStore.set(`login:${state}`, codeVerifier, 'EX', 3600);
+      await stateStore.set(
         `external:${state}`,
         JSON.stringify(getExternalUrl),
         'EX',

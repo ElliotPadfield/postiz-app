@@ -21,7 +21,7 @@ export class InternalJobsRepository {
     // A publish target has a single durable identity across edits/restarts.
     // A completed or uncertain publish cannot be scheduled again implicitly.
     const editable: InternalJobState[] = ['QUEUED', 'CANCELLED'];
-    if (kind === 'ANALYTICS') editable.push('COMPLETED', 'FAILED');
+    if (kind !== 'PUBLISH') editable.push('COMPLETED', 'FAILED');
 
     const key = { organizationId, kind, targetId };
     const existing = await this._jobs.model.internalJob.findUnique({
@@ -153,6 +153,35 @@ export class InternalJobsRepository {
     return result.count === 1;
   }
 
+  async rejectBeforePublish(job: InternalJob) {
+    return this._jobs.model.internalJob.updateMany({
+      where: {
+        id: job.id,
+        state: 'RUNNING',
+        leaseToken: job.leaseToken,
+        leaseExpiresAt: { gt: new Date() },
+      },
+      data: {
+        state: 'FAILED',
+        leaseToken: null,
+        leaseExpiresAt: null,
+        failureCode: 'PUBLISH_PREFLIGHT_FAILED',
+      },
+    });
+  }
+
+  async cancelClaim(job: InternalJob) {
+    return this._jobs.model.internalJob.updateMany({
+      where: {
+        id: job.id,
+        state: 'RUNNING',
+        leaseToken: job.leaseToken,
+        leaseExpiresAt: { gt: new Date() },
+      },
+      data: { state: 'CANCELLED', leaseToken: null, leaseExpiresAt: null },
+    });
+  }
+
   async fail(job: InternalJob, now: Date, retryAt: Date, maxAttempts: number) {
     const state =
       job.kind === 'PUBLISH'
@@ -198,7 +227,7 @@ export class InternalJobsRepository {
     });
     const exhausted = await this._jobs.model.internalJob.updateMany({
       where: {
-        kind: 'ANALYTICS',
+        kind: { not: 'PUBLISH' },
         state: 'RUNNING',
         leaseExpiresAt: { lte: now },
         attempts: { gte: maxAttempts },
@@ -212,7 +241,7 @@ export class InternalJobsRepository {
     });
     const reads = await this._jobs.model.internalJob.updateMany({
       where: {
-        kind: 'ANALYTICS',
+        kind: { not: 'PUBLISH' },
         state: 'RUNNING',
         leaseExpiresAt: { lte: now },
         attempts: { lt: maxAttempts },

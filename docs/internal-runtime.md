@@ -1,55 +1,83 @@
 # Internal Postiz runtime
 
-This fork reuses Postiz's interface and platform providers. It is intended to become an internal planner, publisher and analytics workspace running on one dedicated server, with PostgreSQL holding both application data and durable jobs. The worker can be a second process in the same application image; it does not need another server.
+The calendar and publisher use PostgreSQL jobs. The default deployment is two containers: the Postiz application and PostgreSQL 17. A worker runs inside the backend process when `RUN_WORKER=true`; neither a Temporal server nor Redis is required. The upstream calendar, composer, media library, account connection flows and platform providers remain the starting point.
 
-## Current implementation
+## Futurecraft and personal content
 
-The first change adds an opt-in Nest module at `libraries/nestjs-libraries/src/database/prisma/internal-jobs/`. It provides delayed jobs, rescheduling, cancellation, atomic worker claiming, renewable leases and restart recovery using the existing Prisma dependency. It adds one table and two enums. No existing persisted field changes meaning, and the existing Temporal workflows remain untouched.
+Use Postiz's existing channel groups for **Futurecraft** and **Personal** after connecting the real accounts. There is no seeded account or invented performance data.
 
-**This is a queue foundation, not a completed replacement scheduler.** The module is not imported by the backend, no polling process starts automatically, and no platform publishing or analytics calls are connected to it. The existing calendar still uses Temporal and Redis. There is no new external API or MCP surface.
+For a Futurecraft video, select its channels in one composer session. Postiz's batch ID keeps those posts together in the editor, while each platform gets its own content, settings, publish time and job. One platform failing does not republish a successful platform.
 
-Jobs contain an organization ID, target reference, kind and execution metadata. Tokens, post content, media and provider responses do not belong in the queue. The later publisher will resolve the current target and credentials through the existing services when it runs. These references currently have no foreign keys: the integrating service must validate organization ownership, target existence and approval before enqueueing, and revalidate before calling a provider. This generic service must not be exposed directly as an API.
+For personal Instagram, TikTok, X and LinkedIn content, create separate posts or select only the channels appropriate to that piece. Separate composer sessions get separate batches. Nothing broadcasts every post to every connected profile. Organization ownership is checked on the post and channel, and edits cannot move a post into another organization.
 
-The application uses Prisma conditional updates to claim a job only if its version and queued state still match. This is appropriate for a small internal queue and avoids adding another package or raw SQL. Contention is bounded: a worker yields after ten failed claims and tries on its next poll. No throughput benchmark has been run.
+## Scheduling and recovery
 
-The job service deliberately has different recovery rules:
+Post creation, calendar rescheduling, conversion to draft and deletion save their queue changes in the same Prisma transaction. Workers claim jobs with conditional updates and a version fence. An edit racing a claimed job is rejected before changing the post. Running or pending platform operations cannot be edited or deleted underneath the publisher.
 
-| Event | Publish job | Analytics read |
-|---|---|---|
-| Worker claims the job | Becomes running, gets a unique lease token | Same |
-| Handler succeeds within its live lease | Can complete | Can complete |
-| Handler reports an error | Requires review | Retries with backoff, up to five attempts |
-| Worker disappears or lease expires | Requires review | Requeues, or fails after five attempts |
-| Old worker returns after recovery | Its token cannot complete or renew the job | Same |
-| Already completed target is scheduled again | Rejected | Allowed for another snapshot |
+The worker polls every two seconds. Publishing, analytics and token refresh have independent consumers so an analytics request cannot hold up scheduled publishing. Each kind has one active job per backend process. Run one application replica for this internal deployment; per-provider concurrency across multiple publishing replicas has not been benchmarked or enforced.
 
-An expired publish may already be live on the platform. Queue claiming does not provide exactly-once external delivery. A job in review cannot be automatically scheduled again; a later reconciliation flow must determine the actual platform outcome. No such reconciliation flow is implemented yet. A running publish cannot be cancelled or edited by this queue, because cancellation cannot undo a request already sent.
+Pending upload state is saved privately in `PostExecution`, with durable polling times in the queue. A restart continues status checks without uploading again. A ready result is recorded before finalization, and the worker checks its lease immediately before every publishing mutation. Comments are queued after their parent is confirmed published, with their own delays and durable results.
 
-## Validate locally
+Leases renew while requests run. Publishing operations have a thirty-minute deadline; analytics and refresh have a five-minute deadline. Late results are fenced from follow-up mutations or recording success after a lost lease. A dead worker cannot automatically repeat a possibly accepted post.
 
-Use Docker, Node 22.23.4 (upstream's declared version) and pnpm 10.6.1. Run from the repository root:
+| Situation | Result |
+|---|---|
+| Failure before the durable mutation marker | Post becomes an editable error; correct it and reschedule |
+| Read-only pending-status request fails | Retry with a bounded error budget |
+| Publishing/finalization may already have happened | Preserve the attempt for review; do not automatically repost |
+| Worker disappears during publishing | Expired lease becomes review and appears as a calendar error |
+| Completed platform result | Commit platform ID, URL and completed job together |
+| Notification or webhook delivery fails afterwards | Do not repeat publishing |
+
+Click an errored post's `!` badge to review its outcome. If the post is live, enter its platform ID and HTTPS link to record that fact. This does not send content or remaining comments. If a replacement is appropriate, create a separate post after checking the platform; an uncertain attempt is not silently reset. Review and confirmation are scoped to the current organization.
+
+Token renewal is serialized per channel using an expiring Postgres lock, including concurrent analytics/publishing requests. Providers' propagation delays are preserved. Scheduled refreshes re-read the current credentials and expiry instead of retaining old tokens in jobs. OAuth state/PKCE, upload sessions/tickets, upload lists, caches and public API rate limits also use PostgreSQL, with real expiry and atomic consumption/conditional writes.
+
+## Additional insights
+
+Post statistics now includes a **Watch time and retention** panel with units, collection time and unavailable-data explanations. The existing basic statistics remain available for other platforms.
+
+Instagram collects lifetime views, reach, likes, comments, shares and saves; Reel average watch time, total watch time and skip rate where available; and likes/shares/saves per 100 views. Common counts are fetched together and Reel-only metrics separately, with a fallback for unsupported metrics. An unsupported metric does not erase the others. Watch-time values are stored in milliseconds and displayed in seconds.
+
+YouTube uses the authorized Analytics API for the selected period: views, engaged views, watch time, average view duration, average percentage viewed, likes, comments, shares and subscribers gained. It also requests audience-watch-ratio points and relative retention performance. Rewatch ratios above 100% are preserved, and relative performance is not presented as a viewer percentage. Likes per 100 views uses the same report window for both values. YouTube's Studio swipe-away percentage is not invented from engaged/public view counts.
+
+Snapshots preserve collection time, report window, units, metric sources and nulls for unavailable values. Recent results are cached for ten minutes. Collection runs hourly for recent videos, every six hours after three days and daily after seven days, for up to the 1,000 most recent published roots. The richer collector only queues providers that implement this capability. Account permissions, media eligibility, API limits and reporting delays still determine which metrics are actually returned.
+
+The authenticated internal endpoints are `GET /analytics/post/:postId/insights?days=30` and `GET /analytics/post/:postId/insights/history`. They do not return channel credentials or private upload state. No real social account has been connected or queried by this implementation work, so live account results are not yet verified.
+
+Instagram retention screenshots remain separate source evidence: no verified full-curve endpoint is implemented. References: [Meta's generated insights metric names](https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/insightsresult.py), [YouTube retention reports](https://developers.google.com/youtube/analytics/channel_reports#Audience_Retention), [YouTube metric definitions](https://developers.google.com/youtube/analytics/metrics).
+
+## Deliberate limits
+
+This internal runtime supports ordinary scheduled posts, supported provider comments/threads and pending-media processing. Repeating-post schedules, RSS autopost, automated plugs, managed media normalization, AI video generation and AI clipping are explicitly rejected rather than silently scheduled into a missing worker. Notification emails, when configured, send directly rather than through the old digest workflow. Publish webhooks retain their existing best-effort delivery behavior.
+
+Historical Temporal workflows and their SDK dependencies remain in source for reference/upstream comparison. They are not started by the default dev, build or production scripts, and no Temporal connection module is imported by the backend. The old Redis implementation and direct Redis dependencies have been removed. Do not run the historical orchestrator alongside this worker or point both at the same post database.
+
+## Run and validate
+
+Use Node 22.23.4 and pnpm 10.6.1, as declared upstream. Local validation also ran on Node 24.20.0; the dedicated-server image pins Node 22.23.4.
 
 ```sh
 pnpm install --frozen-lockfile
-pnpm test:internal-jobs
+pnpm dev:docker
+cp .env.example .env
+# Set a unique JWT_SECRET, local URLs, and UPLOAD_DIRECTORY in .env.
+pnpm prisma-db-push
+pnpm dev
 ```
 
-The test runner starts its own PostgreSQL 17 container with a random loopback-only port and temporary storage. It generates the pinned Prisma 6.5 client, pushes the schema to that disposable database, runs integration tests and removes its container/network afterwards. It overrides inherited database URLs; the tests also refuse non-loopback or differently named databases. It never connects to a social platform. If the process is killed before cleanup, remove the `postiz-queue-test-<process-id>` Compose project explicitly.
+The development database binds only to `127.0.0.1:5439`. Keep `RUN_WORKER=false` when inspecting a database whose queued posts should not run. Use `RUN_WORKER=true` when you intentionally want approved scheduled content to publish.
 
-The suite checks delayed execution, sixteen workers competing for one publish, rescheduling, tenant-scoped cancellation, running-job conflicts, uncertain publish outcomes, expired leases, renewal, completed-publish deduplication, read retries, stale workers and persistence across a service restart. These checks validate queue behavior; they do not validate a complete Postiz deployment.
+For a dedicated server, set `PUBLIC_URL`, `POSTGRES_PASSWORD`, `JWT_SECRET` and the required provider OAuth credentials in the private `.env`, then build with `docker compose build` and start with `docker compose up -d`. The application binds to loopback port 5000 for the server's HTTPS reverse proxy. OAuth callbacks and platform-accessible media URLs need that public HTTPS address. Persist and back up both the PostgreSQL and uploads volumes. The server image/production rollout has not been exercised yet; this work has not deployed anything.
 
-The root install hook now runs the Prisma CLI already pinned in this repository instead of downloading a second copy with `pnpm dlx`. This avoids the separate download/build-approval failure observed during initial setup.
+Validation commands:
 
-Validation on 1 November 2026 used Node 24.20.0 and pnpm 10.6.1; Node 24 differs from upstream's declared Node 22.23.4. All 14 real-Postgres integration tests passed, as did `pnpm build:backend`, Prisma schema validation, formatting and `git diff --check`. The repository's ESLint command failed while loading its unchanged Next/FlatCompat configuration (`Converting circular structure to JSON`), before linting the files. No frontend build or full application boot was performed.
+```sh
+pnpm build:backend
+pnpm build:frontend
+POSTIZ_TEST_BOOT=true pnpm test:internal-jobs
+```
 
-## Integration work remaining
+The test runner creates a disposable PostgreSQL instance on a random loopback port, generates the pinned Prisma client, pushes the schema, runs real-database tests with mocked platform APIs, boots the compiled backend with its worker enabled against those fixtures, checks health/authentication, then removes the database container. It overrides inherited database URLs and refuses arbitrary databases. No social publishing or paid AI API is exercised. `git diff --check` and formatting are also checked. ESLint remains blocked while loading the unchanged upstream Next/FlatCompat configuration (`Converting circular structure to JSON`).
 
-1. Introduce a scheduler service at the existing post lifecycle boundary. Save the post change and job intent in one database transaction, cover create/edit/draft/delete races, and make failures visible to the calendar. Do not run the old and new schedulers for the same post.
-2. Build a worker around the existing generic provider interface. Renew leases, validate approval and the current post before a mutation, preserve pending upload state, poll processing status and reconcile uncertain results. Record platform IDs durably before follow-up steps. Cover multi-part posts, delayed comments and repeat schedules before enabling those controls.
-3. Replace Temporal startup hooks, token refresh and the selected notification/background tasks. Features that have not been ported must be disabled visibly rather than silently dropped. Keep upstream workflows versioned and unchanged.
-4. Replace Redis's OAuth state/PKCE storage, upload tickets, caches, locks and throttling with implementations that preserve atomicity and expiry. The in-memory Redis mock is not the server runtime.
-5. Add durable per-post metric snapshots through the provider interface, starting with Instagram and YouTube. Store metric definitions, collection times and unavailable values explicitly. Import retention screenshots separately where the API does not expose the graph. Map existing published videos without creating new platform posts.
-6. Connect scripts, media and animation annotations to those posts for retention analysis. Distinguish observed cuts/motion from model interpretation, and compare videos at similar ages and lengths.
-7. Boot the application without Temporal/Redis, verify the real calendar and account connection flows, and package the dedicated-server deployment. Publishing against an account requires the user's approval for the actual post.
-
-No server has been deployed, no social account has been connected by this change, and no post has been published.
+Validated on 1 November 2026: 37 tests pass; backend and frontend production builds pass; the backend boots against Postgres alone with its worker enabled; authenticated access, query validation and cross-organization isolation pass. Independent review found no remaining P1/P2 blocker after fixes. These are local and mocked-provider results, not proof of a live platform connection or a deployed server.

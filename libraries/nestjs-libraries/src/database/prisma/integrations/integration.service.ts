@@ -4,6 +4,7 @@ import {
   HttpStatus,
   Inject,
   Injectable,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { IntegrationRepository } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.repository';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
@@ -15,7 +16,7 @@ import { Integration, Organization } from '@prisma/client';
 import { NotificationService } from '@gitroom/nestjs-libraries/database/prisma/notifications/notification.service';
 import dayjs from 'dayjs';
 import { timer } from '@gitroom/helpers/utils/timer';
-import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
+import { stateStore } from '@gitroom/nestjs-libraries/state/postgres.state';
 import {
   NotEnoughScopes,
   RefreshToken,
@@ -27,7 +28,6 @@ import { difference, uniq } from 'lodash';
 import utc from 'dayjs/plugin/utc';
 import { AutopostRepository } from '@gitroom/nestjs-libraries/database/prisma/autopost/autopost.repository';
 import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
-import { TemporalService } from 'nestjs-temporal-core';
 
 dayjs.extend(utc);
 
@@ -40,17 +40,14 @@ export class IntegrationService {
     private _integrationManager: IntegrationManager,
     private _notificationService: NotificationService,
     @Inject(forwardRef(() => RefreshIntegrationService))
-    private _refreshIntegrationService: RefreshIntegrationService,
-    private _temporalService: TemporalService
+    private _refreshIntegrationService: RefreshIntegrationService
   ) {}
 
   async changeActiveCron(orgId: string) {
     const data = await this._autopostsRepository.getAutoposts(orgId);
 
     for (const item of data.filter((f) => f.active)) {
-      try {
-        await this._temporalService.terminateWorkflow(`autopost-${item.id}`);
-      } catch (err) {}
+      await this._autopostsRepository.changeActive(orgId, item.id, false);
     }
 
     return true;
@@ -217,10 +214,11 @@ export class IntegrationService {
     newProvider: string,
     auth: { id: string; username: string }
   ) {
-    const existing = await this._integrationRepository.getIntegrationByInternalId(
-      org,
-      oldInternalId
-    );
+    const existing =
+      await this._integrationRepository.getIntegrationByInternalId(
+        org,
+        oldInternalId
+      );
 
     if (
       !existing ||
@@ -507,7 +505,7 @@ export class IntegrationService {
       }
     }
 
-    const getIntegrationData = await ioRedis.get(
+    const getIntegrationData = await stateStore.get(
       `integration:${org.id}:${integration}:${days}`
     );
     if (getIntegrationData) {
@@ -521,7 +519,7 @@ export class IntegrationService {
           getIntegration.token,
           days
         );
-        await ioRedis.set(
+        await stateStore.set(
           `integration:${org.id}:${integration}:${days}`,
           JSON.stringify(loadAnalytics),
           'EX',
@@ -657,18 +655,16 @@ export class IntegrationService {
     integrationId: string,
     body: PlugDto
   ) {
-    const { activated } = await this._integrationRepository.createOrUpdatePlug(
-      orgId,
-      integrationId,
-      body
+    throw new ServiceUnavailableException(
+      'Automated plugs are disabled in the internal runtime'
     );
-
-    return {
-      activated,
-    };
   }
 
   async changePlugActivation(orgId: string, plugId: string, status: boolean) {
+    if (status)
+      throw new ServiceUnavailableException(
+        'Automated plugs are disabled in the internal runtime'
+      );
     const { id, integrationId, plugFunction } =
       await this._integrationRepository.changePlugActivation(
         orgId,

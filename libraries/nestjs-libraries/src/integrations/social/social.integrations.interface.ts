@@ -6,6 +6,12 @@ export interface ClientInformation {
   instanceUrl: string;
 }
 export interface IAuthenticator {
+  postInsights?(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    days: number
+  ): Promise<PostInsights>;
   authenticate(
     params: {
       code: string;
@@ -32,7 +38,7 @@ export interface IAuthenticator {
     integrationId: string,
     accessToken: string,
     postId: string,
-    fromDate: number,
+    fromDate: number
   ): Promise<AnalyticsData[]>;
   resolveReleaseId?(
     accessToken: string,
@@ -73,6 +79,27 @@ export interface AnalyticsData {
   percentageChange: number;
 }
 
+export interface PostInsightMetric {
+  key: string;
+  label: string;
+  value: number | null;
+  unit: 'count' | 'percent' | 'milliseconds' | 'seconds' | 'minutes';
+  source: string;
+  period: 'lifetime' | 'selected_range';
+  unavailable?: string;
+}
+
+export interface PostInsights {
+  metrics: PostInsightMetric[];
+  retention: Array<{
+    elapsedRatio: number;
+    audienceWatchRatio: number;
+    relativePerformance?: number;
+  }>;
+  retentionUnavailable?: string;
+  startDate?: string;
+  endDate?: string;
+}
 
 export type GenerateAuthUrlResponse = {
   url: string;

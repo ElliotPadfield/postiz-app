@@ -1,7 +1,6 @@
 import { HttpException, Injectable } from '@nestjs/common';
 import { Organization } from '@prisma/client';
 import { ApplicationFailure, TypedSearchAttributes } from '@temporalio/common';
-import { TemporalService } from 'nestjs-temporal-core';
 import { ClippingRepository } from '@gitroom/nestjs-libraries/database/prisma/clipping/clipping.repository';
 import { ClippingDto } from '@gitroom/nestjs-libraries/dtos/clipping/clipping.dto';
 import { UploadFactory } from '@gitroom/nestjs-libraries/upload/upload.factory';
@@ -17,11 +16,10 @@ import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/po
 import { MediaService } from '@gitroom/nestjs-libraries/database/prisma/media/media.service';
 import { OpenaiService } from '@gitroom/nestjs-libraries/openai/openai.service';
 import { DeepgramService } from '@gitroom/nestjs-libraries/deepgram/deepgram.service';
-import { organizationId } from '@gitroom/nestjs-libraries/temporal/temporal.search.attribute';
 import { truncateForTemporal } from '@gitroom/nestjs-libraries/integrations/social.abstract';
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { randomBytes } from 'crypto';
-import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
+import { stateStore } from '@gitroom/nestjs-libraries/state/postgres.state';
 import { timer } from '@gitroom/helpers/utils/timer';
 import dayjs from 'dayjs';
 import {
@@ -76,8 +74,7 @@ export class ClippingService {
     private _postsService: PostsService,
     private _mediaService: MediaService,
     private _openAi: OpenaiService,
-    private _deepgram: DeepgramService,
-    private _temporalService: TemporalService
+    private _deepgram: DeepgramService
   ) {}
 
   // Every intermediate file is a flat key, because removeFile only keeps the
@@ -176,123 +173,14 @@ export class ClippingService {
     );
   }
 
-  async startClipping(org: Organization, body: ClippingDto) {
-    if (
-      !this.ingest ||
-      !this.clipper ||
-      !this.storage.signDownloadUrl ||
-      !this.storage.signUploadUrl
-    ) {
-      throw new HttpException('Clipping is not available', 503);
-    }
-
-    if (!this.isYoutubeUrl(body.url)) {
-      throw new HttpException('Only YouTube videos can be clipped', 400);
-    }
-
-    if (org.isTrailing) {
-      throw new HttpException(
-        `Clipping is not available in trial mode. To use it now, open ${process.env.FRONTEND_URL}/billing and click "Finish trial" (this charges the plan immediately)`,
-        406
-      );
-    }
-
-    if ((await this.balance(org.id)) <= 0) {
-      throw new SubscriptionException({
-        action: AuthorizationActions.Create,
-        section: Sections.CLIPPING_MINUTES,
-      });
-    }
-
-    const integrations = body.integrations || [];
-    for (const integration of integrations) {
-      if (
-        !(await this._integrationService.getIntegrationById(
-          org.id,
-          integration
-        ))
-      ) {
-        throw new HttpException(`Channel ${integration} not found`, 400);
-      }
-    }
-
-    const client = this._temporalService.client.getRawClient();
-    if (!client) {
-      throw new HttpException('Clipping is not available', 503);
-    }
-
-    // two starts at the same moment would both see nothing running
-    if (!(await ioRedis.set(`clippingStart:${org.id}`, '1', 'EX', 15, 'NX'))) {
-      throw new HttpException('Another clipping is being started', 429);
-    }
-
-    try {
-      return await this.createClipping(org.id, body, integrations, client);
-    } finally {
-      await ioRedis.del(`clippingStart:${org.id}`);
-    }
-  }
-
-  private async createClipping(
-    org: string,
-    body: ClippingDto,
-    integrations: string[],
-    client: NonNullable<ReturnType<TemporalService['client']['getRawClient']>>
-  ) {
-    const running = await this._clippingRepository.getRunningClippings(org);
-    for (const clipping of running.filter((p) => this.isStale(p))) {
-      await this.failClipping(clipping.id, 'The clipping never finished', true);
-    }
-
-    if (running.filter((p) => !this.isStale(p)).length >= MAX_RUNNING) {
-      throw new HttpException(
-        'A clipping is already running, wait for it to finish',
-        429
-      );
-    }
-
-    if (
-      (await this._clippingRepository.countClippingsSince(
-        org,
-        dayjs().subtract(1, 'day').toDate()
-      )) >= MAX_STARTS_PER_DAY
-    ) {
-      throw new HttpException(
-        'Too many clippings were started today, try again tomorrow',
-        429
-      );
-    }
-
-    const clipping = await this._clippingRepository.createClipping(
-      org,
-      body.url,
-      body.clips || 5,
-      body.fit || 'blur',
-      integrations
+  async startClipping(
+    org: Organization,
+    body: ClippingDto
+  ): Promise<{ id: string }> {
+    throw new HttpException(
+      'AI clipping is disabled in the internal runtime',
+      503
     );
-
-    try {
-      await client.workflow.start('clippingWorkflow', {
-        workflowId: `clipping_${clipping.id}`,
-        taskQueue: 'main',
-        args: [{ clippingId: clipping.id }],
-        typedSearchAttributes: new TypedSearchAttributes([
-          {
-            key: organizationId,
-            value: org,
-          },
-        ]),
-      });
-    } catch (err) {
-      // no workflow means nothing will ever flip the status
-      await this._clippingRepository.updateClipping(org, clipping.id, {
-        status: 'failed',
-        error: 'Could not start clipping',
-      });
-      throw new HttpException('Clipping is not available', 503);
-    }
-
-    return { id: clipping.id };
   }
 
   async getClipping(org: string, id: string) {
@@ -340,7 +228,7 @@ export class ClippingService {
   async createWidgetTicket(org: string, id: string) {
     await this.getClipping(org, id);
     const ticket = randomBytes(32).toString('hex');
-    await ioRedis.set(
+    await stateStore.set(
       `clippingTicket:${ticket}`,
       JSON.stringify({ org, id }),
       'EX',
@@ -365,7 +253,7 @@ export class ClippingService {
     const report =
       sawRunning &&
       ['completed', 'failed'].includes(clipping.status) &&
-      !!(await ioRedis.set(
+      !!(await stateStore.set(
         `clippingReported:${id}`,
         '1',
         'EX',
@@ -378,7 +266,7 @@ export class ClippingService {
 
   async getWidgetTicket(ticket: string) {
     return JSON.parse(
-      (await ioRedis.get(`clippingTicket:${ticket}`)) || 'null'
+      (await stateStore.get(`clippingTicket:${ticket}`)) || 'null'
     ) as { org: string; id: string } | null;
   }
 

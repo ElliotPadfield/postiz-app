@@ -1840,7 +1840,7 @@ model Announcement {
   createdAt   DateTime          @default(now())
 }
 
-// Internal runtime foundation. Not yet connected to the calendar or publishers.
+// Internal Postgres runtime: shared by the calendar and publishing worker.
 // Store references only; never put access tokens or provider responses in jobs.
 model InternalJob {
   id             String           @id @default(uuid())
@@ -1865,6 +1865,46 @@ model InternalJob {
 enum InternalJobKind {
   PUBLISH
   ANALYTICS
+  REFRESH
+}
+
+model TransientState {
+  key       String   @id
+  value     String?
+  items     String[] @default([])
+  expiresAt DateTime
+
+  @@index([expiresAt])
+}
+
+model ApiRateLimit {
+  key          String   @id
+  hits         Int      @default(0)
+  expiresAt    DateTime
+  blockedUntil DateTime?
+
+  @@index([expiresAt])
+}
+
+// Private provider state, never returned by API/MCP controllers.
+model PostExecution {
+  postId      String   @id
+  pendingData Json?
+  phase       String
+  checks      Int      @default(0)
+  readErrors  Int      @default(0)
+  updatedAt   DateTime @updatedAt
+}
+
+model MetricSnapshot {
+  id             String   @id @default(uuid())
+  organizationId String
+  postId         String
+  provider       String
+  collectedAt    DateTime @default(now())
+  data           Json
+
+  @@index([organizationId, postId, collectedAt])
 }
 
 enum InternalJobState {
