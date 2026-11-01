@@ -1,3 +1,9 @@
+## Elliot's internal fork
+
+This fork keeps Postiz's calendar, composer, media library and platform providers as the starting point for an internal planning, publishing and analytics tool. The intended runtime is the application, PostgreSQL and a worker on one dedicated server. See [implementation status and validation](docs/internal-runtime.md).
+
+The Postgres job queue is an opt-in foundation. The existing application still uses Temporal and Redis; it has not been switched to the new queue. The upstream README follows below. This project retains its AGPL-3.0 license.
+
 <p align="center">
   <a href="https://postiz.com/" target="_blank">
   <picture>

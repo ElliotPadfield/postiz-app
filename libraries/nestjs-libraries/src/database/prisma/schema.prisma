@@ -1839,3 +1839,39 @@ model Announcement {
   color       AnnouncementColor @default(INFO)
   createdAt   DateTime          @default(now())
 }
+
+// Internal runtime foundation. Not yet connected to the calendar or publishers.
+// Store references only; never put access tokens or provider responses in jobs.
+model InternalJob {
+  id             String           @id @default(uuid())
+  organizationId String
+  targetId       String
+  kind           InternalJobKind
+  state          InternalJobState @default(QUEUED)
+  runAt          DateTime
+  version        Int              @default(0)
+  attempts       Int              @default(0)
+  leaseToken     String?
+  leaseExpiresAt DateTime?
+  failureCode    String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  @@unique([organizationId, kind, targetId])
+  @@index([kind, state, runAt])
+  @@index([state, leaseExpiresAt])
+}
+
+enum InternalJobKind {
+  PUBLISH
+  ANALYTICS
+}
+
+enum InternalJobState {
+  QUEUED
+  RUNNING
+  COMPLETED
+  CANCELLED
+  FAILED
+  REVIEW
+}
