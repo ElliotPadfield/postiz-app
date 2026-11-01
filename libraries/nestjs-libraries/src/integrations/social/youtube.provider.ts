@@ -1,6 +1,7 @@
 import {
   AnalyticsData,
   PostInsights,
+  PublishedPost,
   PostInsightMetric,
   AuthTokenDetails,
   PendingCheckResponse,
@@ -1023,6 +1024,85 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       return acc;
     } catch (err) {
       return [];
+    }
+  }
+
+  async listPublishedPosts(
+    integrationId: string,
+    accessToken: string,
+    limit: number
+  ): Promise<PublishedPost[]> {
+    const { client, youtube } = clientAndYoutube();
+    client.setCredentials({ access_token: accessToken });
+    const api = youtube(client);
+    try {
+      // Only enumerate the connected channel's own uploads playlist.
+      const channel = await api.channels.list(
+        { id: [integrationId], part: ['contentDetails'] },
+        { timeout: 30000 }
+      );
+      const playlistId =
+        channel.data.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+      if (!playlistId) return [];
+      const result: PublishedPost[] = [];
+      let pageToken: string | undefined;
+      let scanned = 0;
+      do {
+        const page = await api.playlistItems.list(
+          {
+            playlistId,
+            part: ['snippet', 'contentDetails'],
+            maxResults: Math.min(50, limit - scanned),
+            pageToken,
+          },
+          { timeout: 30000 }
+        );
+        const ids = (page.data.items || [])
+          .map((item) => item.contentDetails?.videoId)
+          .filter((id): id is string => !!id);
+        // The owner's uploads playlist also exposes private/scheduled uploads.
+        // Read canonical video status before marking anything as published.
+        const videos = ids.length
+          ? await api.videos.list(
+              { id: ids, part: ['snippet', 'status'] },
+              { timeout: 30000 }
+            )
+          : { data: { items: [] } };
+        for (const item of videos.data.items || []) {
+          const publishedAt = item.snippet?.publishedAt;
+          if (
+            item.id &&
+            publishedAt &&
+            Number.isFinite(Date.parse(publishedAt)) &&
+            Date.parse(publishedAt) <= Date.now() &&
+            item.status?.privacyStatus === 'public' &&
+            item.status?.uploadStatus === 'processed'
+          )
+            result.push({
+              id: item.id,
+              url: `https://www.youtube.com/watch?v=${encodeURIComponent(
+                item.id
+              )}`,
+              publishedAt,
+              content: [item.snippet?.title, item.snippet?.description]
+                .filter(Boolean)
+                .join('\n\n'),
+            });
+        }
+        scanned += page.data.items?.length || 0;
+        pageToken = page.data.nextPageToken;
+        if (!page.data.items?.length) break;
+      } while (pageToken && scanned < limit);
+      return result.slice(0, limit);
+    } catch (error: any) {
+      if (error?.response?.status === 401)
+        throw new RefreshToken(
+          this.identifier,
+          '{}',
+          '{}',
+          'Reconnect YouTube'
+        );
+      throw new Error('Could not list this YouTube channel’s uploads');
     }
   }
 

@@ -266,6 +266,19 @@ export class InstagramStandaloneProvider
     );
   }
 
+  async listPublishedPosts(
+    integrationId: string,
+    token: string,
+    limit: number
+  ) {
+    return instagramProvider.listPublishedPosts(
+      integrationId,
+      token,
+      limit,
+      'graph.instagram.com'
+    );
+  }
+
   async postInsights(
     integrationId: string,
     accessToken: string,

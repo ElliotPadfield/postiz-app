@@ -6,6 +6,11 @@ export interface ClientInformation {
   instanceUrl: string;
 }
 export interface IAuthenticator {
+  listPublishedPosts?(
+    integrationId: string,
+    accessToken: string,
+    limit: number
+  ): Promise<PublishedPost[]>;
   postInsights?(
     integrationId: string,
     accessToken: string,
@@ -87,6 +92,13 @@ export interface PostInsightMetric {
   source: string;
   period: 'lifetime' | 'selected_range';
   unavailable?: string;
+}
+
+export interface PublishedPost {
+  id: string;
+  url: string;
+  publishedAt: string;
+  content: string;
 }
 
 export interface PostInsights {

@@ -5,6 +5,7 @@ import { InternalJobsService } from './internal.jobs.service';
 import { PostsRepository } from '../posts/posts.repository';
 import { PostgresWorker } from './postgres.worker';
 import { PostgresStateStore, stateStore } from '../../../state/postgres.state';
+import { InsightsRepository } from '../insights/insights.repository';
 import { PostgresThrottlerStorage } from '../../../throttler/postgres.throttler';
 
 jest.mock('../posts/posts.service', () => ({ PostsService: class {} }));
@@ -567,6 +568,98 @@ describe('Internal runtime integration', () => {
     release!();
     await firstTick;
     expect(await db.post.count({ where: { state: 'PUBLISHED' } })).toBe(2);
+  });
+
+  it('imports owned published history idempotently without creating publishing jobs', async () => {
+    const insights = new InsightsRepository(model, db as any);
+    const history = [
+      {
+        id: '178000001',
+        url: 'https://www.instagram.com/reel/history/',
+        publishedAt: '2026-10-01T12:00:00Z',
+        content: '<script>alert(1)</script>\nA real caption',
+      },
+    ];
+    expect(
+      await insights.importPublished(
+        'futurecraft',
+        'fc-ig',
+        'instagram',
+        history
+      )
+    ).toMatchObject({ added: 1 });
+    expect(
+      await insights.importPublished(
+        'futurecraft',
+        'fc-ig',
+        'instagram',
+        history
+      )
+    ).toMatchObject({ added: 0, existing: 1 });
+    const imported = await db.post.findFirstOrThrow({
+      where: { integrationId: 'fc-ig' },
+    });
+    expect(imported).toMatchObject({
+      state: 'PUBLISHED',
+      releaseId: '178000001',
+      organizationId: 'futurecraft',
+    });
+    expect(imported.content).toBe(
+      '&lt;script&gt;alert(1)&lt;/script&gt;<br />A real caption'
+    );
+    expect(await db.internalJob.count()).toBe(0);
+    await db.post.update({
+      where: { id: imported.id },
+      data: { deletedAt: new Date() },
+    });
+    await insights.importPublished(
+      'futurecraft',
+      'fc-ig',
+      'instagram',
+      history
+    );
+    expect(
+      (await db.post.findUniqueOrThrow({ where: { id: imported.id } }))
+        .deletedAt
+    ).not.toBeNull();
+  });
+
+  it('rejects history import during unresolved publishing and rolls back fencing', async () => {
+    await create();
+    const job = await db.internalJob.findFirstOrThrow({
+      where: { kind: 'PUBLISH' },
+    });
+    await db.internalJob.update({
+      where: { id: job.id },
+      data: { state: 'REVIEW' },
+    });
+    const insights = new InsightsRepository(model, db as any);
+    await expect(
+      insights.importPublished('futurecraft', 'fc-ig', 'instagram', [])
+    ).rejects.toThrow('Finish or review active publishing');
+    expect(
+      (await db.internalJob.findUniqueOrThrow({ where: { id: job.id } }))
+        .version
+    ).toBe(job.version);
+    expect(await db.post.count()).toBe(1);
+  });
+
+  it('rejects history import while a deferred upload is still pending', async () => {
+    await create();
+    const job = await db.internalJob.findFirstOrThrow({
+      where: { kind: 'PUBLISH' },
+    });
+    await db.postExecution.create({
+      data: { postId: job.targetId, phase: 'PENDING' },
+    });
+    const insights = new InsightsRepository(model, db as any);
+    await expect(
+      insights.importPublished('futurecraft', 'fc-ig', 'instagram', [])
+    ).rejects.toThrow('Finish or review active publishing');
+    expect(
+      (await db.internalJob.findUniqueOrThrow({ where: { id: job.id } }))
+        .version
+    ).toBe(job.version);
   });
 
   it('shares API rate limits across independent storage instances', async () => {

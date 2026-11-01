@@ -159,6 +159,24 @@ try {
         `Authenticated ${path} returned ${result.status}; expected ${expected}.`
       );
   }
+  for (const [integration, limit, expected] of [
+    ['smoke-foreign-org-channel', 10, 404],
+    ['smoke-owned-org-channel', 101, 400],
+    ['smoke-owned-org-channel', 10, 400],
+  ]) {
+    const result = await fetch(
+      `http://127.0.0.1:${port}/analytics/import/${integration}`,
+      {
+        method: 'POST',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ limit }),
+      }
+    );
+    if (result.status !== expected)
+      throw new Error(
+        `Import route returned ${result.status}; expected ${expected}.`
+      );
+  }
   console.log(
     'Backend booted with Postgres only; health, authentication, query validation and cross-organization isolation passed. Worker enabled against disposable fixtures; no social calls made.'
   );

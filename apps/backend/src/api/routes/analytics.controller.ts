@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Query } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { Organization } from '@prisma/client';
 import { GetOrgFromRequest } from '@gitroom/nestjs-libraries/user/org.from.request';
 import { ApiTags } from '@nestjs/swagger';
@@ -6,6 +6,7 @@ import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/in
 import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
 import { InsightsService } from '@gitroom/nestjs-libraries/database/prisma/insights/insights.service';
 import { PostInsightsQueryDto } from '@gitroom/nestjs-libraries/dtos/analytics/post.insights.dto';
+import { ImportPublishedDto } from '@gitroom/nestjs-libraries/dtos/analytics/import.published.dto';
 
 @ApiTags('Analytics')
 @Controller('/analytics')
@@ -23,6 +24,15 @@ export class AnalyticsController {
     @Query('date') date: string
   ) {
     return this._integrationService.checkAnalytics(org, integration, date);
+  }
+
+  @Post('/import/:integration')
+  importPublished(
+    @GetOrgFromRequest() org: Organization,
+    @Param('integration') integration: string,
+    @Body() body: ImportPublishedDto
+  ) {
+    return this._insights.importPublished(org.id, integration, body.limit);
   }
 
   @Get('/post/:postId')

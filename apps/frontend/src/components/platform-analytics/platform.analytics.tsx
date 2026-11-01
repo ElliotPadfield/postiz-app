@@ -39,6 +39,8 @@ export const PlatformAnalytics = () => {
   const [current, setCurrent] = useState(0);
   const [key, setKey] = useState(7);
   const [refresh, setRefresh] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState('');
   const [collapseMenu, setCollapseMenu] = useCookie('collapseMenu', '0');
   const toaster = useToaster();
   const load = useCallback(async () => {
@@ -281,6 +283,44 @@ export const PlatformAnalytics = () => {
       <div className="bg-newBgColorInner flex-1 flex-col flex p-[20px] mobile:p-[12px] gap-[12px]">
         {!!options.length && (
           <div className="flex-1 flex flex-col gap-[14px]">
+            <div className="flex flex-wrap gap-3 items-center">
+              {['instagram', 'instagram-standalone', 'youtube'].includes(
+                currentIntegration?.identifier
+              ) && (
+                <button
+                  type="button"
+                  className="border border-newTableBorder rounded-lg px-3 py-2 disabled:opacity-50"
+                  disabled={importing}
+                  onClick={async () => {
+                    setImporting(true);
+                    setImportResult('');
+                    try {
+                      const response = await fetch(
+                        `/analytics/import/${currentIntegration.id}`,
+                        { method: 'POST', body: JSON.stringify({ limit: 100 }) }
+                      );
+                      if (!response.ok) throw new Error('Import failed');
+                      const result = await response.json();
+                      setImportResult(
+                        `Imported ${result.added} published posts; ${result.existing} already tracked. Open the calendar to inspect post insights.`
+                      );
+                    } catch {
+                      setImportResult(
+                        'Could not import published posts. Check the channel connection and try again.'
+                      );
+                    } finally {
+                      setImporting(false);
+                    }
+                  }}
+                >
+                  {importing ? 'Importing…' : 'Import published posts'}
+                </button>
+              )}
+              <span className="text-sm text-newTableText">
+                {importResult ||
+                  'Import up to 100 existing Instagram or YouTube posts to track their performance. This does not publish anything.'}
+              </span>
+            </div>
             <div className="max-w-[200px]">
               <Select
                 label=""

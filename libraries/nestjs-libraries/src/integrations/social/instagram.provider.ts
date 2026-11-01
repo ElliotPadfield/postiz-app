@@ -1,6 +1,7 @@
 import {
   AnalyticsData,
   PostInsights,
+  PublishedPost,
   PostInsightMetric,
   AuthTokenDetails,
   PendingCheckResponse,
@@ -1361,6 +1362,59 @@ export class InstagramProvider
       duration: audio.duration_in_ms || 0,
       previewUrl: audio.download_url || '',
     }));
+  }
+
+  async listPublishedPosts(
+    integrationId: string,
+    token: string,
+    limit: number,
+    host = 'graph.facebook.com'
+  ): Promise<PublishedPost[]> {
+    const result: PublishedPost[] = [];
+    let after: string | undefined;
+    do {
+      const url = new URL(
+        `https://${host}/${META_GRAPH_API_VERSION}/${encodeURIComponent(
+          integrationId
+        )}/media`
+      );
+      url.searchParams.set('fields', 'id,permalink,caption,timestamp');
+      url.searchParams.set(
+        'limit',
+        String(Math.min(50, limit - result.length))
+      );
+      if (after) url.searchParams.set('after', after);
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${token.split('___')[0]}` },
+        signal: AbortSignal.timeout(30000),
+      });
+      const body = await response.json();
+      if (response.status === 401 || body.error?.code === 190)
+        throw new RefreshToken(
+          this.identifier,
+          '{}',
+          '{}',
+          'Reconnect Instagram'
+        );
+      if (!response.ok || body.error)
+        throw new Error('Could not list this Instagram account’s posts');
+      for (const item of body.data || []) {
+        if (
+          item.id &&
+          item.permalink?.startsWith('https://') &&
+          Number.isFinite(Date.parse(item.timestamp))
+        )
+          result.push({
+            id: String(item.id),
+            url: item.permalink,
+            publishedAt: item.timestamp,
+            content: item.caption || '',
+          });
+      }
+      after = body.paging?.next && body.paging?.cursors?.after;
+      if (!body.data?.length) break;
+    } while (after && result.length < limit);
+    return result.slice(0, limit);
   }
 
   async postInsights(

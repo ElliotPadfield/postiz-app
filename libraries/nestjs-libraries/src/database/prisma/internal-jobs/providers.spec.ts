@@ -19,11 +19,118 @@ jest.mock('googleapis', () => ({
   google: {
     auth: { OAuth2: jest.fn(() => ({ setCredentials: jest.fn() })) },
     youtubeAnalytics: jest.fn(),
+    youtube: jest.fn(),
   },
 }));
 
 describe('Additional provider insights', () => {
   afterEach(() => jest.restoreAllMocks());
+
+  it('imports numeric Instagram media IDs across pages without following token-bearing next URLs', async () => {
+    const read = jest
+      .spyOn(global, 'fetch')
+      .mockImplementation(async (input, init) => {
+        const url = new URL(String(input));
+        expect(url.hostname).toBe('graph.facebook.com');
+        expect(url.pathname).toMatch(/\/owned-account\/media$/);
+        expect(url.searchParams.has('access_token')).toBe(false);
+        expect((init?.headers as any).Authorization).toBe(
+          'Bearer TEST_ONLY_TOKEN'
+        );
+        const second = url.searchParams.get('after') === 'cursor';
+        return new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: second ? '178002' : '178001',
+                permalink: 'https://www.instagram.com/reel/test/',
+                timestamp: '2026-10-01T12:00:00Z',
+                caption: 'Caption',
+              },
+            ],
+            paging: second
+              ? {}
+              : {
+                  next: 'https://malicious.invalid/?access_token=secret',
+                  cursors: { after: 'cursor' },
+                },
+          })
+        );
+      });
+    const posts = await new InstagramProvider().listPublishedPosts(
+      'owned-account',
+      'TEST_ONLY_TOKEN___user',
+      2
+    );
+    expect(posts.map((post) => post.id)).toEqual(['178001', '178002']);
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it('imports videos only from the connected YouTube channel uploads playlist', async () => {
+    const channels = jest.fn(async () => ({
+      data: {
+        items: [
+          { contentDetails: { relatedPlaylists: { uploads: 'UU-owned' } } },
+        ],
+      },
+    }));
+    const playlist = jest.fn(async () => ({
+      data: {
+        items: [
+          {
+            contentDetails: {
+              videoId: 'video-owned',
+              videoPublishedAt: '2026-10-01T12:00:00Z',
+            },
+            snippet: { title: 'Title', description: 'Description' },
+          },
+        ],
+      },
+    }));
+    (google.youtube as jest.Mock).mockReturnValue({
+      channels: { list: channels },
+      playlistItems: { list: playlist },
+      videos: {
+        list: jest.fn(async () => ({
+          data: {
+            items: [
+              {
+                id: 'video-owned',
+                snippet: {
+                  title: 'Title',
+                  publishedAt: '2026-10-01T12:00:00Z',
+                },
+                status: { privacyStatus: 'public', uploadStatus: 'processed' },
+              },
+              {
+                id: 'private',
+                snippet: { publishedAt: '2026-10-01T12:00:00Z' },
+                status: { privacyStatus: 'private', uploadStatus: 'processed' },
+              },
+              {
+                id: 'scheduled',
+                snippet: { publishedAt: '2099-01-01T00:00:00Z' },
+                status: { privacyStatus: 'public', uploadStatus: 'processed' },
+              },
+              { id: 'deleted', status: { uploadStatus: 'deleted' } },
+            ],
+          },
+        })),
+      },
+    });
+    const posts = await new YoutubeProvider().listPublishedPosts(
+      'UC-owned',
+      'TEST_ONLY_TOKEN',
+      100
+    );
+    expect(channels.mock.calls[0][0]).toMatchObject({ id: ['UC-owned'] });
+    expect(playlist.mock.calls[0][0]).toMatchObject({ playlistId: 'UU-owned' });
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({
+      id: 'video-owned',
+      url: 'https://www.youtube.com/watch?v=video-owned',
+    });
+  });
 
   it('collects Instagram watch time/skip rate and derives rates with an explicit denominator', async () => {
     const values = {
