@@ -70,6 +70,8 @@ The development database binds only to `127.0.0.1:5439`. Keep `RUN_WORKER=false`
 
 For a dedicated server, set `PUBLIC_URL`, `POSTGRES_PASSWORD`, `JWT_SECRET` and the required provider OAuth credentials in the private `.env`, then build with `docker compose build` and start with `docker compose up -d`. The application binds to loopback port 5000 for the server's HTTPS reverse proxy. OAuth callbacks and platform-accessible media URLs need that public HTTPS address. Persist and back up both the PostgreSQL and uploads volumes. The server image/production rollout has not been exercised yet; this work has not deployed anything.
 
+For Coolify, select `docker-compose.coolify.yaml` and route the `app` service to port 5000. Set `PUBLIC_URL` and `BOOTSTRAP_OWNER_EMAIL`; Coolify generates the database password, JWT secret and owner password using its `SERVICE_*` variables. Keep these credentials and provider secrets runtime-only. Startup initializes the first owner before the HTTP processes start, then leaves existing credentials untouched on later launches. The owner has organization administration rights, not global application administrator access. The Compose file publishes no host port and owns separate PostgreSQL/uploads volumes. Use the owner's generated password to log in; do not expose it in deployment logs or source control.
+
 Validation commands:
 
 ```sh

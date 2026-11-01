@@ -1,0 +1,74 @@
+# Git-based Coolify application. Route app to https://content.elliotpadfield.com:5000.
+# Coolify generates the database/JWT values; provider secrets are runtime-only.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.internal
+      args:
+        NEXT_PUBLIC_BACKEND_URL: ${PUBLIC_URL:?}/api
+        NEXT_PUBLIC_UPLOAD_STATIC_DIRECTORY: ${PUBLIC_URL:?}/uploads
+    restart: unless-stopped
+    environment:
+      SERVICE_URL_APP_5000: ''
+      DATABASE_URL: postgresql://postiz:${SERVICE_PASSWORD_64_POSTGRES}@postgres:5432/postiz
+      JWT_SECRET: ${SERVICE_BASE64_64_JWT}
+      RUN_WORKER: 'true'
+      DISABLE_REGISTRATION: 'true'
+      BOOTSTRAP_OWNER_EMAIL: ${BOOTSTRAP_OWNER_EMAIL:?}
+      BOOTSTRAP_OWNER_PASSWORD: ${SERVICE_PASSWORD_64_OWNER}
+      FRONTEND_URL: ${PUBLIC_URL:?}
+      MAIN_URL: ${PUBLIC_URL:?}
+      NEXT_PUBLIC_BACKEND_URL: ${PUBLIC_URL:?}/api
+      BACKEND_INTERNAL_URL: http://localhost:3000
+      STORAGE_PROVIDER: local
+      UPLOAD_DIRECTORY: /uploads
+      NEXT_PUBLIC_UPLOAD_STATIC_DIRECTORY: ${PUBLIC_URL:?}/uploads
+      FACEBOOK_APP_ID: ${FACEBOOK_APP_ID:-}
+      FACEBOOK_APP_SECRET: ${FACEBOOK_APP_SECRET:-}
+      INSTAGRAM_APP_ID: ${INSTAGRAM_APP_ID:-}
+      INSTAGRAM_APP_SECRET: ${INSTAGRAM_APP_SECRET:-}
+      YOUTUBE_CLIENT_ID: ${YOUTUBE_CLIENT_ID:-}
+      YOUTUBE_CLIENT_SECRET: ${YOUTUBE_CLIENT_SECRET:-}
+      TIKTOK_CLIENT_ID: ${TIKTOK_CLIENT_ID:-}
+      TIKTOK_CLIENT_SECRET: ${TIKTOK_CLIENT_SECRET:-}
+      X_API_KEY: ${X_API_KEY:-}
+      X_API_SECRET: ${X_API_SECRET:-}
+      LINKEDIN_CLIENT_ID: ${LINKEDIN_CLIENT_ID:-}
+      LINKEDIN_CLIENT_SECRET: ${LINKEDIN_CLIENT_SECRET:-}
+    expose:
+      - '5000'
+    volumes:
+      - uploads:/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "Promise.all([fetch('http://127.0.0.1:5000'),fetch('http://127.0.0.1:3000')]).then(rs=>process.exit(rs.every(r=>r.status<500)?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postiz
+      POSTGRES_PASSWORD: ${SERVICE_PASSWORD_64_POSTGRES}
+      POSTGRES_DB: postiz
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postiz -d postiz']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+volumes:
+  postgres:
+  uploads:

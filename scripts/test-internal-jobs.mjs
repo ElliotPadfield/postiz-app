@@ -45,6 +45,9 @@ try {
     ['exec', 'prisma', 'db', 'push', '--skip-generate', '--schema', schema],
     env
   );
+  if (process.env.POSTIZ_TEST_BOOT === 'true') {
+    run(process.execPath, ['scripts/smoke-owner-bootstrap.mjs'], env);
+  }
   run(
     'pnpm',
     [
