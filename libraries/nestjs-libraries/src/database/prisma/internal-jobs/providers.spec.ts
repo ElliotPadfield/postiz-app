@@ -287,6 +287,66 @@ describe('Additional provider insights', () => {
   });
 });
 
+describe('YouTube Brand Account authorization', () => {
+  afterEach(() => jest.restoreAllMocks());
+  it('resolves identity through YouTube for a grant without Google profile permissions', async () => {
+    const provider = new YoutubeProvider();
+    const tokens = {
+      access_token: 'TEST_ONLY_TOKEN',
+      refresh_token: 'TEST_ONLY_REFRESH',
+      expiry_date: Date.now() + 3600000,
+    };
+    const auth = {
+      setCredentials: jest.fn(),
+      getToken: jest.fn(async () => ({ tokens })),
+      getTokenInfo: jest.fn(async () => ({ scopes: provider.scopes })),
+      refreshAccessToken: jest.fn(async () => ({ credentials: tokens })),
+    };
+    (google.auth.OAuth2 as jest.Mock)
+      .mockImplementationOnce(() => auth)
+      .mockImplementationOnce(() => auth);
+    const channels = jest.fn(async () => ({
+      data: {
+        items: [
+          {
+            id: 'UC-Futurecraft',
+            snippet: {
+              title: 'Explained by Futurecraft',
+              customUrl: '@byfuturecraft',
+              thumbnails: { default: { url: 'https://example.com/photo.jpg' } },
+            },
+          },
+        ],
+      },
+    }));
+    (google.youtube as jest.Mock).mockReturnValue({
+      channels: { list: channels },
+    });
+    expect(
+      provider.scopes.every(
+        (scope) =>
+          scope.includes('/youtube.') ||
+          scope.endsWith('/yt-analytics.readonly')
+      )
+    ).toBe(true);
+    expect(
+      await provider.authenticate({
+        code: 'TEST_ONLY_CODE',
+        codeVerifier: 'state',
+      })
+    ).toMatchObject({
+      id: 'UC-Futurecraft',
+      name: 'Explained by Futurecraft',
+      username: '@byfuturecraft',
+    });
+    expect(await provider.refreshToken('TEST_ONLY_REFRESH')).toMatchObject({
+      id: 'UC-Futurecraft',
+      refreshToken: 'TEST_ONLY_REFRESH',
+    });
+    expect(channels).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('Personal LinkedIn self-service authorization', () => {
   afterEach(() => jest.restoreAllMocks());
   it('accepts the actual self-service grant and never calls the restricted legacy profile API', async () => {

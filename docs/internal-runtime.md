@@ -84,8 +84,10 @@ POSTIZ_TEST_BOOT=true pnpm test:internal-jobs
 
 The test runner creates a disposable PostgreSQL instance on a random loopback port, generates the pinned Prisma client, pushes the schema, runs real-database tests with mocked platform APIs, boots the compiled backend with its worker enabled against those fixtures, checks health/authentication, then removes the database container. It overrides inherited database URLs and refuses arbitrary databases. No social publishing or paid AI API is exercised. `git diff --check` and formatting are also checked. ESLint remains blocked while loading the unchanged upstream Next/FlatCompat configuration (`Converting circular structure to JSON`).
 
-Validated on 1–2 November 2026: 43 tests pass; backend and frontend production builds pass; the backend boots against Postgres alone with its worker enabled; authenticated access, query validation and cross-organization isolation pass. Independent review found no remaining P1/P2 blocker after fixes. These are local and mocked-provider results, not proof of a live platform connection or a deployed server.
+Validated on 1–2 November 2026: 44 tests pass; backend and frontend production builds pass; the backend boots against Postgres alone with its worker enabled; authenticated access, query validation and cross-organization isolation pass. Independent review found no remaining P1/P2 blocker after fixes. These are local and mocked-provider results, not proof of a live platform connection or a deployed server.
 
 Public static app information is available at `/about.html`, `/privacy.html` and `/terms.html` for provider OAuth branding. These pages contain no workspace records and do not grant access to the app.
 
 Personal LinkedIn uses the self-service OpenID profile and member-posting permissions. Company Page authorization remains separate. Personal company-tag lookup requires additional approved organization permissions; it is not enabled by the basic self-service grant.
+
+YouTube OAuth requests only YouTube and YouTube Analytics scopes, and reads the authorized native channel identity through `channels.list(mine=true)`. Google profile/email scopes are not needed for this connection.

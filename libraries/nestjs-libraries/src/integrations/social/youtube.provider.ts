@@ -49,13 +49,7 @@ const clientAndYoutube = () => {
       auth: newClient,
     });
 
-  const oauth2 = (newClient: OAuth2Client) =>
-    google.oauth2({
-      version: 'v2',
-      auth: newClient,
-    });
-
-  return { client, youtube, oauth2, youtubeAnalytics };
+  return { client, youtube, youtubeAnalytics };
 };
 
 @Rules('YouTube must have on video attachment, it cannot be empty')
@@ -66,8 +60,6 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
   isBetweenSteps = true;
   dto = YoutubeSettingsDto;
   scopes = [
-    'https://www.googleapis.com/auth/userinfo.profile',
-    'https://www.googleapis.com/auth/userinfo.email',
     'https://www.googleapis.com/auth/youtube.force-ssl',
     'https://www.googleapis.com/auth/youtube.readonly',
     'https://www.googleapis.com/auth/youtube.upload',
@@ -283,26 +275,54 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
     return undefined;
   }
 
+  private async channelIdentity(client: OAuth2Client) {
+    // Brand Accounts authorize YouTube APIs, not Google profile access. Resolve
+    // the native channel identity without requesting unrelated userinfo scopes.
+    let channel;
+    try {
+      const response = await google
+        .youtube({ version: 'v3', auth: client })
+        .channels.list({ mine: true, part: ['snippet'] }, { timeout: 30000 });
+      channel = response.data.items?.[0];
+    } catch {
+      throw new BadBody(
+        this.identifier,
+        '{}',
+        '{}',
+        'Could not read the authorized YouTube channel. Reconnect and check channel access.'
+      );
+    }
+    if (!channel?.id)
+      throw new BadBody(
+        this.identifier,
+        '{}',
+        '{}',
+        'This Google account has no YouTube channel. Select the account or Brand Account that owns the channel.'
+      );
+    return {
+      id: channel.id,
+      name: channel.snippet?.title || 'YouTube channel',
+      picture: channel.snippet?.thumbnails?.default?.url || '',
+      username: channel.snippet?.customUrl || '',
+    };
+  }
+
   async refreshToken(refresh_token: string): Promise<AuthTokenDetails> {
-    const { client, oauth2 } = clientAndYoutube();
+    const { client } = clientAndYoutube();
     client.setCredentials({ refresh_token });
     const { credentials } = await client.refreshAccessToken();
-    const user = oauth2(client);
     const expiryDate = new Date(credentials.expiry_date!);
     const unixTimestamp =
       Math.floor(expiryDate.getTime() / 1000) -
       Math.floor(new Date().getTime() / 1000);
 
-    const { data } = await user.userinfo.get();
+    const identity = await this.channelIdentity(client);
 
     return {
       accessToken: credentials.access_token!,
       expiresIn: unixTimestamp!,
       refreshToken: credentials.refresh_token ?? refresh_token,
-      id: data.id!,
-      name: data.name!,
-      picture: data?.picture || '',
-      username: '',
+      ...identity,
     };
   }
 
@@ -327,14 +347,13 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
     codeVerifier: string;
     refresh?: string;
   }) {
-    const { client, oauth2 } = clientAndYoutube();
+    const { client } = clientAndYoutube();
     const { tokens } = await client.getToken(params.code);
     client.setCredentials(tokens);
     const { scopes } = await client.getTokenInfo(tokens.access_token!);
     this.checkScopes(this.scopes, scopes);
 
-    const user = oauth2(client);
-    const { data } = await user.userinfo.get();
+    const identity = await this.channelIdentity(client);
 
     const expiryDate = new Date(tokens.expiry_date!);
     const unixTimestamp =
@@ -345,10 +364,7 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       accessToken: tokens.access_token!,
       expiresIn: unixTimestamp,
       refreshToken: tokens.refresh_token!,
-      id: data.id!,
-      name: data.name!,
-      picture: data?.picture || '',
-      username: '',
+      ...identity,
     };
   }
 
