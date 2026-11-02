@@ -1,5 +1,6 @@
 import 'reflect-metadata';
 import { InstagramProvider } from '../../../integrations/social/instagram.provider';
+import { LinkedinProvider } from '../../../integrations/social/linkedin.provider';
 import { YoutubeProvider } from '../../../integrations/social/youtube.provider';
 import { RefreshToken } from '../../../integrations/social.abstract';
 import { WalletProvider } from '@gitroom/backend/services/auth/providers/wallet.provider';
@@ -9,7 +10,13 @@ import { stateStore } from '../../../state/postgres.state';
 import { google } from 'googleapis';
 
 jest.mock('../../../integrations/social.abstract', () => ({
-  SocialAbstract: class {},
+  SocialAbstract: class {
+    checkScopes(required: string[], got: string | string[]) {
+      const granted = Array.isArray(got) ? got : got.split(' ');
+      if (!required.every((scope) => granted.includes(scope)))
+        throw new Error('Missing granted scopes');
+    }
+  },
   RefreshToken: class extends Error {},
   BadBody: class extends Error {},
   PublishedWithError: class extends Error {},
@@ -277,6 +284,51 @@ describe('Additional provider insights', () => {
       relativePerformance: 0.8,
     });
     expect(query).toHaveBeenCalledTimes(10);
+  });
+});
+
+describe('Personal LinkedIn self-service authorization', () => {
+  afterEach(() => jest.restoreAllMocks());
+  it('accepts the actual self-service grant and never calls the restricted legacy profile API', async () => {
+    const fetch = jest
+      .spyOn(global, 'fetch')
+      .mockImplementation(async (input) => {
+        if (String(input) === 'https://www.linkedin.com/oauth/v2/accessToken')
+          return new Response(
+            JSON.stringify({
+              access_token: 'TEST_ONLY_TOKEN',
+              expires_in: 5184000,
+              scope: 'openid profile w_member_social',
+            })
+          );
+        if (String(input) === 'https://api.linkedin.com/v2/userinfo')
+          return new Response(
+            JSON.stringify({
+              sub: 'member-id',
+              name: 'Elliot',
+              picture: 'https://example.com/photo.jpg',
+            })
+          );
+        throw new Error(
+          'This endpoint is not allowed by the self-service grant'
+        );
+      });
+    const provider = new LinkedinProvider();
+    const auth = await provider.generateAuthUrl();
+    const url = new URL(auth.url);
+    expect(url.searchParams.get('scope')?.split(' ')).toEqual([
+      'openid',
+      'profile',
+      'w_member_social',
+    ]);
+    expect(url.searchParams.get('prompt')).not.toBe('none');
+    expect(
+      await provider.authenticate({
+        code: 'TEST_ONLY_CODE',
+        codeVerifier: 'state',
+      })
+    ).toMatchObject({ id: 'member-id', name: 'Elliot', username: '' });
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });
 
